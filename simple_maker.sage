@@ -6,7 +6,7 @@
 # 2  q                       int
 # 3  polynomial              list of ints
 # 4  angle_numbers           list of floats
-# 5  angle_ranks             int ("" if unfilled)
+# 5  angle_rank              int ("" if unfilled)
 # 6  p_rank                  int
 # 7  slopes                  list of strings
 # 8  A_counts                list of ints
