@@ -1,21 +1,30 @@
 
- LABEL????
-*isog_label                   | text      | label for isogeny class
-*frac_ideal                   | numeric[] | basis for fractional ideal, expressed in terms of V^{g-1},...,V,1,F,F^2,...,F^g
-*rep_type                     | smallint  | 0=ordinary or Centeleghe-Stix,...
-*is_reduced                   | boolean   | Whether the fractional ideal is reduced (HNF, minimal norm, lexicographic within same norm)
- cm_type                      | boolean[] | Whether the +imaginary embedding is a p-adic non-unit, for embeddings sorted by real part
-*cm_elt                       | numeric[] | An element of Q[F] that is positive imaginary under each embedding in the CM type
- can_be_principally_polarized | boolean   | Whether this abelian variety has a principal polarization
- rational_invariants          | numeric[] | Invariant factors of A(F_q)
-*is_product                   | boolean   | Whether this isomorphism class is a product of smaller dimensional abelian varieties
- product_factorization        | jsonb     | List of pairs (label, e) expressing this as a product of smaller dimensional abelian varities (NULL if not)
- endo_ring                    | jsonb     | Some kind of description....
- related_objects              | text[]    | List of URLs
+Table name: `av_fqisom`
+
+This table represents abelian varieties up to isomorphism, without a polarization.
+
+Column                       | Type      | Notes
+-----------------------------|-----------|------
+label                        | text      | `g.q.weil.enum`, where `g` is the dimension, `q` is the cardinality of the base field, `weil` is the encoding of the Weil polynomial and `enum` is a base-26 encoding of `isom_num`
+isom_num                     | integer   | A 0-based enumeration of the isomorphism classes within an isogeny class, TBD
+isog_label                   | text      | label for isogeny class
+frac_ideal                   | numeric[] | basis for fractional ideal, expressed in terms of V^{g-1},...,V,1,F,F^2,...,F^g
+rep_type                     | smallint  | 0=ordinary or Centeleghe-Stix,...
+is_reduced                   | boolean   | Whether the fractional ideal is reduced (HNF, minimal norm, lexicographic within same norm)
+cm_type                      | boolean[] | Whether the +imaginary embedding is a p-adic non-unit, for embeddings sorted by real part
+cm_elt                       | numeric[] | An element of Q[F] that is positive imaginary under each embedding in the CM type
+can_be_principally_polarized | boolean   | Whether this abelian variety has a principal polarization
+rational_invariants          | numeric[] | Invariant factors of A(F_q)
+is_product                   | boolean   | Whether this isomorphism class is a product of smaller dimensional abelian varieties
+product_factorization        | jsonb     | List of pairs (label, e) expressing this as a product of smaller dimensional abelian varities (NULL if not)
+endo_ring                    | jsonb     | Some kind of description....
+related_objects              | text[]    | List of URLs
 
 
 
-LABEL????
+Column              | Type       | Notes
+--------------------|------------|------
+label               | text       | ?????
 isom_label          | text       |
 degree              | smallint   | degree of the polarization
 kernel              | smallint[] | invariant factors for the kernel of the isogeny (cokernel of the map of lattices)
@@ -29,27 +38,33 @@ invariants          | jsonb      | For small genus, a list of geometric invarian
 
 
 
-
-
-
 Things to add for the isogeny class
 
+Column           | Type    | Notes
+-----------------|---------|------
 order_is_bass    | boolean | whether all the over-orders for the order Z[F,V] are Gorenstein
 order_is_maximal | boolean | whether the order Z[F,V] is maximal
 size             | integer | number of isomorphism classes within the isogeny class
 
+ * Whether or not two isogeny classes come together after base extension, and what the degree is
+ * isogeny_graphs
+ * ideal class monoid (as an integer matrix)
+
+
+For Stefano
+-----------
 
 For each isogeny class, write lines to two files
-isomorphism_classes.txt (one line per ideal)
-isog_label:frac_ideal:rep_type::cm_elt:is_product
+
+ * isomorphism_classes.txt (one line per ideal)
+```
+isog_label:frac_ideal:rep_type:is_reduced:cm_elt:is_product
 e.g.
 1.251.v:{{1,0},{0,1}}:0:f:{21,2}:f
-
-isogeny_classes.txt (one line per class)
+```
+ * isogeny_classes.txt (one line per class)
+```
 isog_label:order_is_bass:order_is_maximal:size
+e.g.
 1.251.v:t:t:9
-
-* Whether or not two isogeny classes come together after base extension, and what the degree is
-* isogeny_graphs
-* ideal class monoid (as an integer matrix)
-
+```
