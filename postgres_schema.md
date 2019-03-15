@@ -1,8 +1,6 @@
-Table name: `av_fqisog`
+Table name: `av_fq_isog`
 
 This table represents unpolarized abelian varieties, up to isogeny.
-
-Things to add for the isogeny class
 
 Column                       | Type       | Notes
 -----------------------------|------------|------
@@ -22,6 +20,7 @@ dim3_distinct                | smallint   | Number of distinct dimension 3 facto
 dim4_distinct                | smallint   | Number of distinct dimension 4 factors
 dim5_distinct                | smallint   | Number of distinct dimension 5 factors
 poly                         | integer[]  | Coefficients of the Weil polynomial.  The first will always be `1` and the last `q^g`
+real_poly                    | integer[]  | Coefficients of the real Weil polynomial, whose roots are the traces down to R of the roots of the Weil polynomial
 angles                       | float8[]   | Angles corresponding to roots in the closure of the upper half plane, divided by `pi`.  All will be in the interval `[0, 1]`, and there will be `g` of them unless `0` or `1` is included.
 angle_rank                   | smallint   | The dimension of the Q-span of the angles (see knowl for complete definition)
 slopes                       | text[]     | The sorted list of slopes, as string representations of rational numbers.  Duplicated slopes will have "A", "B", etc appended.
@@ -36,26 +35,18 @@ is_simple                    | boolean    |
 simple_factors               | text[]     | A list of labels of simple factors.  Duplicated factors will have "A", "B", etc appended.
 simple_distinct              | text[]     | A list of distinct labels of simple factors.
 simple_multiplicities        | smallint[] | For each distinct simple factor, the multiplicity in the decomposition.
-number_field_degrees         | smallint[] | For each distinct simple factor, the degree of the the corresponding number field.
-divalg_dimensions            | smallint[] | For each distinct simple factor, the dimension of the division algebra over the number field.
 number_fields                | text[]     | The number fields associated to the irreducible factors of the Weil polynomial
 galois_groups                | text[]     | The Galois groups of the number fields associated to the irreducible factors of the Weil polynomial, e.g. "4T3"
-places                       | text[]     | A list of lists of lists of rational numbers stored as strings, giving the prime ideals above `p`.  The terms in the outer list correspond to distinct simple factors, the terms in the middle lists correspond to places in the corresponding number field, and each inner list gives coefficients for a two-element generator of that prime ideal (along with `p`) as coefficients of powers of `F`.
-brauer_invariants            | text[]     | A list of lists of rational numbers stored as strings.  The terms in the outer list correspond to distinct simple factors, and the terms in each inner list correspond to the places in the corresponding number field.
 geometric_extension_degree   | smallint   | The smallest degree extension of the base field over which the endomorphism algebra becomes the full endomorphism algebra
-geometric_simple_factors     | text[]     | A list of labels of simple factors after base changing by the geometric extension degree.  Duplicated factors will have "A", "B", etc appended.  NULL if geometric_extension_degree is 1.
-geometric_simple_distinct    | text[]     | A list of distinct labels of simple factors after geometric base change.  NULL if geometric_extension_degree is 1.
-geometric_multiplicities     | smallint[] | For each distinct geometric simple factor, the multiplicity in the decomposition.  NULL if geometric_extension_degree is 1.
-geometric_number_field_degrees| smallint[] | For each distinct geometric simple factor, the degree of the corresponding number field.  NULL if geometric_extension_degree is 1.
-geometric_divalg_dimensions  | smallint[] | For each distinct geometric simple factor, the dimension of the division algebra over the number field.  NULL if geometric_extension_degree is 1.
-geometric_number_fields      | text[]     | The number fields associated to the irreducible factors of the base-changed Weil polynomial.  NULL if geometric_extension_degree is 1.
-geometric_galois_groups      | text[]     | The Galois groups of the geometric number fields.  NULL if geometric_extension_degree is 1.
-geometric_places             | text[]     | Places, after base changing to the geometric field.
-geometric_brauer_invariants  | text[]     | Brauer invariants, after bas changing to the geometric field.
+center_dim                   | smallint   | The dimension of the center of the endomorphism algebra End^0(A) over Q
+geometric_center_dim         | smallint   | The dimension of the center of the geometric endomorphism algebra End^0_{q^r}(A) over Q, where r is the geometric extension degree
 primitive_models             | text[]     | A list of labels giving primitive models for this isogeny class (ie, this class arises from base change from the model).  If primitive, NULL.
 is_primitive                 | boolean    |
 twists                       | jsonb      | A list of triples `(label, geom_label, r)` where `label` is the label of a twist, `r` is an extension degree where the twists become isomorphic, and `geom_label` is the label of the common base change to that degree.
-size                         | integer    | number of isomorphism classes within the isogeny class
+
+size                         | integer    | number of isomorphism classes within the isogeny class (isomorphisms of unpolarized abelian varieties)
+ppav_count                   | integer    | number of isomorphism classes of principally polarized abelain varieties within the isogeny class (isomorphisms of polarized abelian varieties)
+jacobian_count               | integer    | number of isomorphism classes of Jacobians within the isogeny class (isomorphisms of polarized abelian varieties)
 zfv_is_bass                  | boolean    | whether all the over-orders for the order `Z[F,V]` are Gorenstein
 zfv_is_maximal               | boolean    | whether the order `Z[F,V]` is maximal
 zfv_index                    | numeric    | the index of the order `Z[F,V]` in the maximal order
@@ -67,9 +58,32 @@ isogeny_graphs               | jsonb      | list of pairs `(p, G)`, where `p` is
 ideal_class_generators       | text[]     | A list of `isom_letters` for isomorphism classes that generate the ideal monoid
 ideal_class_relations        | integer[]  | A matrix of positive integers giving relations between the ideal class generators
 
+Table name: `av_fq_endalg_factors`
 
+There will be a row in this table for each simple factor of an isogeny class over an extension field GF(q^r), where r divides the geometric extension degree
 
-Table name: `av_fqisom`
+Column           | Type     | Notes
+-----------------|----------|------
+base_label       | text     | The label for the base isogeny class, with (q,g) in our range, either simple or non-simple
+extension_label  | text     | The label for a simple factor of the base change
+extension_degree | smallint | The degree of the extension (could be 1)
+multiplicity     | smallint | The multiplicity of this simple factor in the base change
+
+Table name: `av_fq_endalg_data`
+
+Data to specify endomorphism algebra for base changed isogeny classes, as a division algebra over its center
+
+Column            | Type     | Notes
+------------------|----------|------
+extension_label   | text     | The label for the base changed simple isogeny class (which may be out of our (g,q) range)
+center            | text     | The number field label for the center of the endomorphism algebra End^0_{q^r}(A)
+galois_group      | text     | The transitive label (e.g. "4T3") for the Galois group of the center
+center_dim        | smallint | The degree of the center over Q
+divalg_dim        | smallint | The dimension of the endomorphism algebra End^0_{q^r}(A) over its center
+places            | text     | A list of lists of rational numbers stored as strings, giving the prime ideals above `p`.  The terms in the outer list correspond to places in the corresponding number field, and each inner list gives coefficients for a two-element generator of that prime ideal (along with `p`) as coefficients of powers of `F`.  They are sorted so that the valuation of `F` is increaasing.
+brauer_invariants | text     | A list of rational numbers stored as strings, giving the Brauer invariants for End^0_{q^r}(A) as a division algebra over its center
+
+Table name: `av_fq_isom`
 
 This table represents unpolarized abelian varieties, up to isomorphism.
 
@@ -96,7 +110,7 @@ endo_ring                    | jsonb     | Some kind of description....
 related_objects              | text[]    | List of URLs
 
 
-Table name: `av_fqpol`
+Table name: `av_fq_pol`
 
 This table represents polarized abelian varieties, up to isomorphism.
 
@@ -104,17 +118,26 @@ Column              | Type       | Notes
 --------------------|------------|------
 label               | text       | ?????
 isom_label          | text       |
+representative      | 
 degree              | smallint   | degree of the polarization
 kernel              | smallint[] | invariant factors for the kernel of the isogeny (cokernel of the map of lattices)
-is_decomposible     | boolean    | Whether this polarized abelian variety is a product
+is_decomposable     | boolean    | Whether this polarized abelian variety is a product
 decomposition       | jsonb      | List of pairs (label, e) expressing this polarized abelian variety as a product (NULL if not)
 aut_group           | text       | GAP id
 geom_aut_group      | text       | GAP id
-is_serre_obstructed | smallint   | -1 if not a Jacobian, 0 if a hyperelliptic Jacobian, 1 if a nonhyperelliptic Jacobian
+is_hyperelliptic    | boolean    |
+is_geometrically_hyperelliptic | boolean |
+is_jacobian         | boolean |
+is_geometrically_jacobian | boolean |
 invariants          | jsonb      | For small genus, a list of geometric invariants (e.g. Igusa).  Only possible in the principal case
 
 
+Table name: `curves_fq`
 
+Column              | Type       | Notes
+--------------------|------------|------
+model
+???
 
 Things to add for the isogeny class
 

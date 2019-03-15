@@ -57,7 +57,8 @@ def check_all(rootdir=None):
         if simplematcher.match(filename):
             check_dataspec(filename)
 
-def know_simple_pp(g, q, coeffs):
+def know_simple_pp(g, q, coeffs, plus_poly):
+    # q = a^2 - b st x^4 + ax^3 + bx^2 + aqx + q^2, b neg, coprime to q and all prime divisors are 1 mod 3
     if g == 1:
         return 1r
     if g == 2:
@@ -70,11 +71,47 @@ def know_simple_pp(g, q, coeffs):
             return -1r
         else:
             return 1r
+    elif g % 2 == 1:
+        # Every odd-dimensional simple isogeny class has a principal polarization
+        return 1r
+    else:
+        # Look at the CM field K and its real subfield K+.
+        # If K/K+ is ramified at a finite prime, or if there is a prime of K+
+        # that divides F - V and that is inert in K/K+,
+        # then there's a principally polarized variety in the isogeny class.
+        poly = plus_poly.parent()(coeffs)
+        K.<F> = NumberField(poly)
+        Kplus.<Fplus> = NumberField(plus_poly)
+        D = K.discriminant()
+        Dplus = Kplus.discriminant()
+        if D.abs() != Dplus^2:
+            return 1r
+        V = q / F
+        # F -> V is complex conjugation
+        conj = K.hom([V])
+        for PP, e in K.ideal(F - V).factor():
+            # Being inert in K/K+ is the same as being equal to the complex conjugate
+            if PP == PP.apply_morphism(conj):
+                return 1r
+        if coeffs[g].gcd(q) == 1:
+            # Otherwise, if ordinary, you can do the following:
+            # Let N be the positive square root of Norm_{K/Q} (F - V).
+            # (If we are in this case, the norm is a square.)
+            # If q > 2, there is a principally-polarized variety in the isogeny class iff
+            # N is congruent modulo q to the coefficient of x^g in the Weil polynomial.
+            # If q = 2, there is a PPAV in the isogeny class if and only if N is congruent
+            # modulo 4 to the coefficient of x^g in the Weil polynomial.
+            Nsquared = ZZ((F-V).norm())
+            N = Nsquared.isqrt()
+            if Nsquared != N^2:
+                raise RuntimeError
+            qq = q if q > 2 else 4
+            return 1r if (N - coeffs[g]) % qq == 0 else -1r
     return 0r
 
-def know_nonsimple_pp(g, q, coeffs):
+def know_nonsimple_pp(g, q, coeffs, gplus):
     if g == 2:
-        return know_simple_pp(g, q, coeffs)
+        return know_simple_pp(g, q, coeffs, gplus)
     return 0r
 
 def know_simple_jac(g, q, p, r, coeffs, p_rank):
@@ -167,6 +204,7 @@ def create_line(Lpoly, polydata, simple = True):
         if jac == 1r:
             raise RuntimeError("Incorrect value for Known Jacobian")
         jac = -1r
+        ## Add divisibility tests
     line = [polydata.label, # label
             int(polydata.g), # dim
             int(polydata.q), # q
@@ -363,27 +401,27 @@ def clean(qmin, qmax, rootdir=None):
     models = _make_models_dict(qs, rootdir)
     _fill_primitive_models(models, qs, rootdir)
 
-def fix_places_and_jac_pp(rootdir=None):
-    rootdir = rootdir or os.path.abspath(os.curdir)
-    for filename in os.listdir(rootdir):
-        match = simplematcher.match(filename)
-        if match:
-            print filename
-            g, q = map(Integer, match.groups())
-            p, r = q.is_prime_power(get_data=True)
-            # if g = 2
-            # q power of 3 or q=r^2 where r=2 (mod 3)
-            # then pp is True
-            s = ""
-            with open(filename) as F:
-                for line in F.readlines():
-                    data = json.loads(line.strip())
-                    assert len(data) == 19
-                    coeffs = data[3]
-                    p_rank = data[6]
-                    data[10] = know_simple_jac(g, q, p, r, coeffs, p_rank)
-                    data[11] = know_simple_pp(g, q, coeffs)
-                    data[14] = [data[14]]
-                    s += json.dumps(data) + '\n'
-            with open(filename, 'w') as F:
-                F.write(s)
+#def fix_places_and_jac_pp(rootdir=None):
+#    rootdir = rootdir or os.path.abspath(os.curdir)
+#    for filename in os.listdir(rootdir):
+#        match = simplematcher.match(filename)
+#        if match:
+#            print filename
+#            g, q = map(Integer, match.groups())
+#            p, r = q.is_prime_power(get_data=True)
+#            # if g = 2
+#            # q power of 3 or q=r^2 where r=2 (mod 3)
+#            # then pp is True
+#            s = ""
+#            with open(filename) as F:
+#                for line in F.readlines():
+#                    data = json.loads(line.strip())
+#                    assert len(data) == 19
+#                    coeffs = data[3]
+#                    p_rank = data[6]
+#                    data[10] = know_simple_jac(g, q, p, r, coeffs, p_rank)
+#                    data[11] = know_simple_pp(g, q, coeffs)
+#                    data[14] = [data[14]]
+#                    s += json.dumps(data) + '\n'
+#            with open(filename, 'w') as F:
+#                F.write(s)
