@@ -27,14 +27,19 @@ Primitive models:
 
 from sage.databases.cremona import cremona_letter_code, class_to_int # for the make_label function
 from sage.misc.lazy_attribute import lazy_attribute
-import json, os, re
+import json, os, re, sys
 opj, ope = os.path.join, os.path.exists
 from collections import defaultdict
 from itertools import combinations_with_replacement, imap, izip_longest
 from ConfigParser import ConfigParser
 from lmfdb import db
 
-load("prescribed_roots.sage")
+try:
+    # Add the location of weil_polynomials.pyx to the load path
+    sys.path.append(os.path.dirname(os.path.realpath(__file__)))
+except NameError:
+    pass
+load("weil_polynomials.pyx")
 
 ######################################################################################################
 
