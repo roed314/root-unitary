@@ -12,7 +12,7 @@
 #distutils: language = c
 #distutils: libraries = gomp
 #distutils: sources = power_sums.c
-#distutils: include_dirs = /home/kedlaya/sage/local/include/flint .
+#distutils: include_dirs = /home/sage/sage-root/local/include/flint .
 ## Remove the next line if OpenMP is not available
 #distutils: extra_compile_args = -fopenmp
 
