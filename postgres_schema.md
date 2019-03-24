@@ -28,7 +28,7 @@ abvar_counts                 | numeric[]  | The list of counts `#A(F_{q^i})` for
 abvar_counts_str             | text       | A space separated string of abelian variety counts, for searching
 curve_counts                 | numeric[]  | The list of curve counts `#C(F_{q^i})` for `i=1..10` for any curve `C` of genus `g` with `J(C)` in this isogeny class
 curve_counts_str             | text       | A space separated string of curve counts, for searching
-point_count                  | integer    | The count `#C(F_q)`, duplicated for searching purposes
+curve_count                  | integer    | The count `#C(F_q)`, duplicated for searching purposes
 has_jacobian                 | smallint   | 1 if it is known that this isogeny class contains a Jacobian; -1 if it is known that it does not; 0 otherwise
 has_principal_polarization   | smallint   | 1 if it is known that this isogeny class contains a principally polarizable abelian variety; -1 if it is known that it does not; 0 otherwise
 is_simple                    | boolean    |
@@ -171,7 +171,7 @@ ideal_class_relations        | integer[] | A matrix of positive integers giving 
  - A_cnts_str -> abvar_counts_str (text)
  - C_cnts -> curve_counts (jsonb -> numeric[])
  - C_cnts_str -> curve_counts_str (text)
- - pt_cnt -> point_count (integer)
+ - pt_cnt -> curve_count (integer)
  - is_jac -> has_jacobian (smallint -> boolean)
  - is_pp -> has_principal_polarization (smallint -> boolean)
  - decomp -> decomposition (jsonb)
