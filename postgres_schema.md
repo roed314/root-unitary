@@ -174,7 +174,7 @@ ideal_class_relations        | integer[] | A matrix of positive integers giving 
  - pt_cnt -> curve_count (integer)
  - is_jac -> has_jacobian (smallint -> boolean)
  - is_pp -> has_principal_polarization (smallint -> boolean)
- - decomp -> decomposition (jsonb)
+ - decomp -> XXX
  - is_simp -> is_simple (boolean)
  - simple_factors (jsonb -> text[])
  - simple_distinct (jsonb -> text[])

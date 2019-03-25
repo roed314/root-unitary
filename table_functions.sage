@@ -331,6 +331,10 @@ class PGOld(PGType):
             self.new_name = new_name
             self.switch = switch
         else:
+            if not hasattr(self, 'new_name'):
+                self.new_name = None
+            if not hasattr(self, 'switch') or self.switch is None:
+                self.switch = lambda x: x
             self(func)
     def __call__(self, func):
         PGType.__init__(self, func)
@@ -374,9 +378,9 @@ class GenericTask(object):
     @lazy_attribute
     def input_data(self):
         """
-        Should be overridden in subclass
+        Default behavior can beoverridden in subclass
         """
-        return []
+        return [filename.format(g=self.g, q=self.q) for filename in self.stage.input]
 
 class Worker(object):
     def __init__(self, logfile):
@@ -520,7 +524,7 @@ class IsogenyClasses(object):
 
     class StageGenerateAll(Stage):
         name = 'Generate All'
-        shortname = 'Gen All'
+        shortname = 'GenAll'
         class Task(GenericTask):
             @lazy_attribute
             def input_data(self):
@@ -555,8 +559,7 @@ class IsogenyClasses(object):
         class Task(GenericTask):
             def __init__(self, g, p, stage):
                 self.g, self.p, self.stage = g, p, stage
-                controller = stage.controller
-                self.qs = [q for (g, q) in controller.gq if q%p == 0]
+                self.qs = [q for (g, q) in stage.controller.gq if g == self.g and q%p == 0]
                 self.rs = [q.is_prime_power(get_data=True)[1] for q in self.qs]
 
             @lazy_attribute
@@ -641,11 +644,8 @@ class IsogenyClasses(object):
                         controller.save(filename, in_db[r].values(), attributes)
     class StageCombine(Stage):
         name = 'Combine'
-        shortname = 'Combine'
+        shortname = 'Combo'
         class Task(GenericTask):
-            @lazy_attribute
-            def input_data(self):
-                return [filename.format(g=self.g, q=self.q) for filename in self.stage.input]
             def run(self, logfile):
                 stage = self.stage
                 controller = stage.controller
@@ -666,14 +666,94 @@ class IsogenyClasses(object):
         shortname = 'DBLoad'
         class Task(GenericTask):
             def run(self, logfile):
-                stage = self.stage
-                controller = stage.controller
                 outfile, _ = self.stage.output[0]
                 outfile = outfile.format(g=self.g, q=self.q)
                 cols = [(attr.__name__, attr.pg_type) for attr in IsogenyClass.__dict__ if isinstance(attr, PGOld)]
                 col_names, col_types = zip(*cols)
-                selecter = SQL("SELECT {0} FROM av_fqisog WHERE g=%s AND q = %s"%(self.g, self.q)).format(SQL(", ").join(map(Identifier, col_names)))
-                db._copy_to_select(selecter, outfile)
+                selecter = SQL("SELECT {0} FROM av_fqisog WHERE g={1} AND q = {2}").format(SQL(", ").join(map(Identifier, col_names)), Literal(self.g), Literal(self.q))
+                header = "%s\n%s\n\n" % (":".join(col_names), ":".join(col_types))
+                db._copy_to_select(selecter, outfile, header=header)
+    class StageGenerateMissing(Stage):
+        name = 'GenerateMissing'
+        shortname = 'GenMissing'
+        class Task(GenericTask):
+            @lazy_attribute
+            def input_data(self):
+                g, q = self.g, self.q
+                if self.r % 2 == 1: # Only missing data when q is not a square
+                    gs = range(g%2, g+1, 2)
+                else:
+                    gs = [g]
+                return [(gg, self.stage.input[0].format(g=gg, q=q)) for gg in gs]
+            def run(self, logfile):
+                stage = self.stage
+                controller = stage.controller
+                sources = {g: list(controller.load(filename)) for (g, filename) in self.input_data}
+                lookup = {IC.label: IC for g, ICs in sources.items() for IC in ICs}
+                q = self.q
+                SC = IsogenyClass(poly=[1,0,-2*q,0,q**2])
+                def make_all():
+                    for g, olddata in sources.items():
+                        for IC in olddata:
+                            IC.set_from_old() # Set the new-style attributes using the ones from the database
+                            if g == self.g:
+                                yield IC
+                            else:
+                                factors = [(lookup[label], mult) for label, mult in IC.decomp] + [(SC, (self.g - g)//2)]
+                                yield IsogenyClass.by_decomposition(factors)
+                filename, attributes = self.stage.output[0]
+                filename = filename.format(g=self.g, q=selfq)
+                controller.save(filename, make_all(), attributes)
+    class Stage BasechangeOld(Stage):
+        name = 'BasechangeOld'
+        shortname = 'BCO'
+        @lazy_attribute
+        def tasks(self):
+            return [self.Task(g, q, self) for g, q in self.controller.gq if q.is_prime()]
+        class Task(GenericTask):
+            def __init__(self, g, p, stage):
+                self.g, self.p, self.stage = g, p, stage
+                self.qs = [q for (g, q) in stage.controller.gq if g == self.g and q%p == 0]
+                self.rs = [q.is_prime_power(get_data=True)[1] for q in self.qs]
+
+            @lazy_attribute
+            def input_data(self):
+                return [(r, self.stage.input[0].format(g=self.g, q=q)) for q, r in zip(self.qs, self.rs)]
+            @lazy_attribute
+            def output_data(self):
+                stage = self.stage
+                filename, attributes = stage.output[0]
+                return [(r, filename.format(g=self.g, q=self.p^r), attributes)]
+            def run(self, logfile):
+                stage = self.stage
+                controller = stage.controller
+                g, p = self.g, self.p
+                in_db = {r: {IC.label: IC for IC in controller.load(filename)} for (r, filename) in self.input_data}
+                base_changes = defaultdict(lambda: defaultdict(list))
+                for ICs in in_db.values():
+                    for IC in ICs.values():
+                        IC.primitive_models = []
+                for r, ICs in in_db.items():
+                    q = p**r
+                    for IC in ICs.values():
+                        if IC.primitive_models: # already a base change
+                            continue
+                        for s in self.rs:
+                            # Note that this s differs from the s in BaseChange by a factor of r
+                            if s > r and s%r == 0:
+                                BC = IsogenyClass(Lpoly=base_change(IC.Lpoly, s//r, g=g, q=q))
+                                # Get the version of BC with everything computed
+                                BC = in_db[s][BC.label]
+                                BC.primitive_models.append(IC.label)
+                # Check to see that we agree with the old version when present
+                for ICs in in_db.values():
+                    for IC in ICs.values():
+                        # Sorting?
+                        if IC.prim_models is not None and sorted(IC.prim_models) != sorted(IC.primitive_models):
+                            raise RuntimeError((IC.prim_models, IC.primitive_models))
+                        IC.prim_models = IC.primitive_models
+                for r, filename, attributes in self.output_data:
+                    controller.save(filename, in_db[r].values(), attributes)
     class StageCheck(Stage):
         name = 'Check'
         shortname = 'Check'
@@ -1733,7 +1813,19 @@ class IsogenyClass(PGSaver):
         """
         pass
 
-    # The following support access to the old schema
+    # The following methods and attributes support access to the old schema
+
+    def set_from_old(self, check=False):
+        for aname, attr in self.__class__.__dict__.items():
+            newname = attr.new_name
+            if newname: # Some old columns don't have direct new analogues
+                oldval = getattr(self, aname)
+                newval = attr.switch(oldval)
+                if check:
+                    compval = getattr(self, newname)
+                    if newval != compval:
+                        raise ValueError("%s -> %s: %s vs %s"%(aname, newname, newval, compval))
+                setattr(self, newname, newval)
 
     @pg_jsonb_old
     def old_poly(self):
@@ -1782,7 +1874,7 @@ class IsogenyClass(PGSaver):
 
     @pg_jsonb_old(new_name='decomposition')
     def decomp(self):
-        return self.decomposition
+        return [(IC.label, e) for IC, e in self.decomposition]
 
     @pg_boolean_old(new_name='is_simple')
     def is_simp(self):
