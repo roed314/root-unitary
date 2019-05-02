@@ -14,7 +14,7 @@
 #distutils: sources = power_sums.c
 #distutils: include_dirs = /home/sage/sage-root/local/include/flint .
 ## Remove the next line if OpenMP is not available
-#distutils: extra_compile_args = -fopenmp
+## Removed #distutils: extra_compile_args = -fopenmp
 
 ## TODO: remove hard-coding of include directory
 

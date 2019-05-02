@@ -30,7 +30,7 @@ from sage.misc.lazy_attribute import lazy_attribute
 import json, os, re, sys
 opj, ope = os.path.join, os.path.exists
 from collections import defaultdict
-from itertools import combinations_with_replacement, imap, izip_longest
+from itertools import combinations_with_replacement
 from ConfigParser import ConfigParser
 from lmfdb import db
 from psycopg2.sql import SQL
@@ -204,6 +204,7 @@ def signed_class_to_int(code):
 # to disk in a format readable by postgres
 
 class PGType(lazy_attribute):
+    check=None # bound for integer types
     @classmethod
     def _load(cls, x):
         """
@@ -239,7 +240,7 @@ class PGType(lazy_attribute):
             return cls.save(x)
 
     @classmethod
-    def save(cls, x):
+    def save(cls, x, recursing=False):
         """
         Takes a Sage object stored in this attribute
         and returns a string appropriate to write to a file
@@ -250,23 +251,39 @@ class PGType(lazy_attribute):
         This default function can be overridden in subclasses.
         """
         if isinstance(x, list):
-            return str(x).replace('[','{').replace(']','}').replace("'",'"')
+            return '{' + ','.join(cls.save(a) for a in x) + '}'
         else:
-            return str(x)
+            if cls.check and (x >= cls.check or x <= -cls.check):
+                raise ValueError("Out of bounds")
+            x = str(x)
+            if recursing:
+                return '"' + x + '"'
+            else:
+                return x
 
 class pg_text(PGType):
     pg_type = 'text'
 class pg_smallint(PGType):
+    check = 2**15-1
     pg_type = 'smallint'
 class pg_integer(PGType):
+    check = 2**31-1
     pg_type = 'integer'
+class pg_bigint(PGType):
+    check = 2**63-1
+    pg_type = 'bigint'
 class pg_numeric(PGType):
     # Currently only used to store large integers, so no decimal handling needed
     pg_type = 'numeric'
 class pg_smallint_list(PGType):
+    check = 2**15-1
     pg_type = 'smallint[]'
 class pg_integer_list(PGType):
+    check = 2**31-1
     pg_type = 'integer[]'
+class pg_bigint_list(PGType):
+    check = 2**63-1
+    pg_type = 'bigint[]'
 class pg_float8_list(PGType):
     pg_type = 'float8[]'
 class pg_text_list(PGType):
@@ -378,7 +395,7 @@ class GenericTask(object):
     @lazy_attribute
     def input_data(self):
         """
-        Default behavior can beoverridden in subclass
+        Default behavior can be overridden in subclass
         """
         return [filename.format(g=self.g, q=self.q) for filename in self.stage.input]
 
@@ -386,27 +403,7 @@ class Worker(object):
     def __init__(self, logfile):
         self.logfile = logfile
 
-class IsogenyClasses(object):
-    """
-    This class controls the creation of isogeny classes, grouped by g and q,
-    as well as the process of loading and saving them to disk and to the LMFDB
-
-    INPUT:
-
-    - ``workers`` -- the number of processes to be allocated to this computation
-    - ``config`` -- the filename for the configuration file, an example of which follows:
-
-      [extent]
-      g1 = 2-10,16
-      g2 = 2-5
-      [stage1]
-      __dir__ = simple/
-      all = all/
-      complete = complete/
-
-    Directories can be relative or absolute, and are indicated by ``__dir__``.
-    Data specified within each stage is cumulative.
-    """
+class Controller(object):
     def __init__(self, worker_count=1, config=None):
         if config is None:
             if os.path.exists('config.ini'):
@@ -414,45 +411,8 @@ class IsogenyClasses(object):
             else:
                 raise ValueError("Must have config.ini in directory or specify location")
         self.config_file = config
-        cfgp = ConfigParser()
+        self.cfgp = cfgp = ConfigParser()
         cfgp.read(config)
-        gs = sorted([ZZ(gx[1:]) for gx in cfgp.options('extent')])
-        if not gs:
-            raise ValueError('Config file must specify [extent] section with lines like "g3=2-16,25"')
-        self.gq = []
-        gq_dict = {}
-        for g in gs:
-            qs_raw = cfgp.get('extent', 'g%s'%g)
-            qs_split = qs_raw.split(',')
-            qs = []
-            for qrange in qs_split:
-                qrange = qrange.strip()
-                if qrange.count('-') == 1:
-                    a,b = map(ZZ,qrange.split('-'))
-                    for q in srange(a, b+1):
-                        if q > 1 and q.is_prime_power():
-                            qs.append(q)
-                else:
-                    q = ZZ(qrange)
-                    if q.is_prime_power():
-                        qs.append(q)
-                    else:
-                        raise ValueError("q=%s in g%s line is not a prime power" % (q, g))
-            if not qs:
-                raise ValueError("No qs specified for the given g")
-            gq_dict[g] = D = set(qs)
-            for q in qs:
-                for d in q.divisors():
-                    if d != 1 and d not in D:
-                        raise ValueError("q=%s is included for g=% but its divisor %s is not" % (q, g, d))
-                for gg in range(1,g):
-                    if q not in gq_dict[gg]:
-                        raise ValueError("g=%s is included for q=%s but g=%s is not" % (g, q, gg))
-                self.gq.append((g, q))
-        # We want to do low q, high g first.  This way we have all the values for a given q,
-        # but do the high dimension cases first since these will take the longest.
-        self.gq.sort(key=lambda pair: (pair[1], -pair[0]))
-
         # Create subdirectories if they do not exist
         basedir = os.path.abspath(os.path.expanduser(cfgp.get('dirs', 'base')))
         if not ope(basedir):
@@ -494,6 +454,69 @@ class IsogenyClasses(object):
         worker = self.workers[0]
         for task in self.tasks:
             task.run(worker.logfile)
+
+class IsogenyClasses(Controller):
+    """
+    This class controls the creation of isogeny classes, grouped by g and q,
+    as well as the process of loading and saving them to disk and to the LMFDB
+
+    INPUT:
+
+    - ``workers`` -- the number of processes to be allocated to this computation
+    - ``config`` -- the filename for the configuration file, an example of which follows:
+
+      [extent]
+      g1 = 2-10,16
+      g2 = 2-5
+      [stage1]
+      __dir__ = simple/
+      all = all/
+      complete = complete/
+
+    Directories can be relative or absolute, and are indicated by ``__dir__``.
+    Data specified within each stage is cumulative.
+    """
+    def __init__(self, worker_count=1, config=None):
+        self.default_cls = IsogenyClass
+        Controller.__init__(self, worker_count, config)
+        cfgp = self.cfgp
+        gs = sorted([ZZ(gx[1:]) for gx in cfgp.options('extent')])
+        if not gs:
+            raise ValueError('Config file must specify [extent] section with lines like "g3=2-16,25"')
+        self.gq = []
+        gq_dict = {}
+        for g in gs:
+            qs_raw = cfgp.get('extent', 'g%s'%g)
+            qs_split = qs_raw.split(',')
+            qs = []
+            for qrange in qs_split:
+                qrange = qrange.strip()
+                if qrange.count('-') == 1:
+                    a,b = map(ZZ,qrange.split('-'))
+                    for q in srange(a, b+1):
+                        if q > 1 and q.is_prime_power():
+                            qs.append(q)
+                else:
+                    q = ZZ(qrange)
+                    if q.is_prime_power():
+                        qs.append(q)
+                    else:
+                        raise ValueError("q=%s in g%s line is not a prime power" % (q, g))
+            if not qs:
+                raise ValueError("No qs specified for the given g")
+            gq_dict[g] = D = set(qs)
+            for q in qs:
+                for d in q.divisors():
+                    if d != 1 and d not in D:
+                        raise ValueError("q=%s is included for g=% but its divisor %s is not" % (q, g, d))
+                for gg in range(1,g):
+                    if q not in gq_dict[gg]:
+                        raise ValueError("g=%s is included for q=%s but g=%s is not" % (g, q, gg))
+                self.gq.append((g, q))
+        # We want to do low q, high g first.  This way we have all the values for a given q,
+        # but do the high dimension cases first since these will take the longest.
+        self.gq.sort(key=lambda pair: (pair[1], -pair[0]))
+
 
     class StageGenerateSimple(Stage):
         name = 'Generate Simple'
@@ -776,12 +799,11 @@ class IsogenyClasses(object):
                     outfile = outfile.format(g=self.g, q=self.q)
                     controller.save(outfile, reports, attributes, cls=ValidationReport)
 
-    @staticmethod
-    def load(filename, start=None, stop=None, cls=None, old=False):
+    def load(self, filename, start=None, stop=None, cls=None, old=False):
         """
         Iterates over all of the isogeny classes stored in a file.
         The data contained in the file is specified by header lines: the first giving the
-        column names (which are identical to PGType attributes of IsogenyClass)
+        column names (which are identical to PGType attributes of a PGSaver `cls`)
         the second giving postgres types (unused here), and the third blank.
 
         We use ':' as a separator.
@@ -792,11 +814,12 @@ class IsogenyClasses(object):
         - ``start`` -- if not ``None``, the line to start from, indexed so that 0 is
             the first line of data.  Note that this will be the fourth line of the
             file because of the header.
-        - ``stop`` -- if not None``, the first line not to read, indexed as for ``start``.
+        - ``stop`` -- if not None``, the first line not to read, indexed as for ``start``
+        - ``cls`` -- the PGSaver class to load data into
         - ``old`` -- if True, uses 'old_'+attr for attributes in the header if possible
         """
         if cls is None:
-            cls = IsogenyClass
+            cls = self.default_cls
         def fix_attr(attr):
             if old and hasattr(cls, 'old_' + attr):
                 attr = 'old_' + attr
@@ -806,10 +829,9 @@ class IsogenyClasses(object):
                 if i == 0:
                     header = map(fix_attr, line.strip().split(':'))
                 elif i >= 3 and (start is None or i-3 >= start) and (stop is None or i-3 < start):
-                    yield IsogenyClass.load(line.strip(), header)
+                    yield cls.load(line.strip(), header)
 
-    @staticmethod
-    def save(filename, isogeny_classes, attributes, cls=None, force=False):
+    def save(self, filename, isogeny_classes, attributes, cls=None, force=False):
         """
         INPUT:
 
@@ -823,7 +845,7 @@ class IsogenyClasses(object):
         # if not force and ope(filename):
         #     raise ValueError("File %s already exists"%filename)
         if cls is None:
-            cls = IsogenyClass
+            cls = self.default_cls
         types = [getattr(cls, attr) for attr in attributes]
         header = [':'.join(attributes),
                   ':'.join(attr.pg_type for attr in types),
