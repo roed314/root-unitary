@@ -211,6 +211,7 @@ def signed_class_to_int(code):
 # to disk in a format readable by postgres
 
 class PGType(lazy_attribute):
+    check=None # bound for integer types
     def _load(self, x):
         """
         Wraps :meth:`load` for the appropriate handling of NULLs.
@@ -244,7 +245,7 @@ class PGType(lazy_attribute):
         else:
             return self.save(x)
 
-    def save(self, x):
+    def save(self, x, recursing=False):
         """
         Takes a Sage object stored in this attribute
         and returns a string appropriate to write to a file
@@ -256,27 +257,44 @@ class PGType(lazy_attribute):
         """
         if isinstance(x, list):
             if self.pg_type == 'jsonb':
-                return str(x).replace("'", '"')
+                return '[' + ','.join(PGType.save(self, a) for a in x) + ']'
             else:
-                return str(x).replace('[','{').replace(']','}').replace("'",'"')
+                return '{' + ','.join(PGType.save(self, a) for a in x) + '}'
         else:
-            return str(x)
+            if self.check and (x >= self.check or x <= -self.check):
+                raise ValueError("Out of bounds")
+            if isinstance(x, basestring):
+                return '"' + x + '"'
+            else:
+                return str(x)
 
 class pg_text(PGType):
     pg_type = 'text'
     def load(self, x):
         return x
+    def save(self, x):
+        return x
 class pg_smallint(PGType):
+    check = 2**15-1
     pg_type = 'smallint'
 class pg_integer(PGType):
+    check = 2**31-1
     pg_type = 'integer'
+class pg_bigint(PGType):
+    check = 2**63-1
+    pg_type = 'bigint'
 class pg_numeric(PGType):
     # Currently only used to store large integers, so no decimal handling needed
     pg_type = 'numeric'
 class pg_smallint_list(PGType):
+    check = 2**15-1
     pg_type = 'smallint[]'
 class pg_integer_list(PGType):
+    check = 2**31-1
     pg_type = 'integer[]'
+class pg_bigint_list(PGType):
+    check = 2**63-1
+    pg_type = 'bigint[]'
 class pg_float8_list(PGType):
     pg_type = 'float8[]'
 class pg_text_list(PGType):
@@ -403,7 +421,7 @@ class GenericTask(object):
     @lazy_attribute
     def input_data(self):
         """
-        Default behavior can beoverridden in subclass
+        Default behavior can be overridden in subclass
         """
         return [(None, filename.format(g=self.g, q=self.q)) for filename in self.stage.input]
     @lazy_attribute
@@ -414,7 +432,112 @@ class Worker(object):
     def __init__(self, logfile):
         self.logfile = logfile
 
-class IsogenyClasses(object):
+class Controller(object):
+    def __init__(self, worker_count=1, config=None):
+        if config is None:
+            if os.path.exists('config.ini'):
+                config = os.path.abspath('config.ini')
+            else:
+                raise ValueError("Must have config.ini in directory or specify location")
+        self.config_file = config
+        self.cfgp = cfgp = ConfigParser()
+        cfgp.read(config)
+        # Create subdirectories if they do not exist
+        basedir = os.path.abspath(os.path.expanduser(cfgp.get('dirs', 'base')))
+        if not ope(basedir):
+            os.makedirs(basedir)
+        subdirs = [sub.strip() for sub in cfgp.get('dirs', 'subdirs').split(',')] + ['logs']
+        for subdir in subdirs:
+            if not ope(opj(basedir, subdir)):
+                os.mkdir(opj(basedir, subdir))
+        self._extra_init()
+
+        # Create Stages
+        stages = []
+        self.logfile_template = opj(basedir, cfgp.get('logging', 'logfile'))
+        self.logfrequency = int(cfgp.get('logging', 'logfrequency'))
+        self.logheader = cfgp.get('logging', 'logheader') + ' '
+        plan = ['Stage'+stage.strip() for stage in cfgp.get('plan', 'stages').split(',')]
+        for stage in plan:
+            if stage not in cfgp.sections():
+                raise ValueError("Missing section %s"%stage)
+            info = [(key, cfgp.get(stage, key)) for key in cfgp.options(stage)]
+            input = [opj(basedir, val) for (key, val) in info if key.startswith('in')]
+            if any(key.startswith('out') for key, val in info):
+                output, output_indexes = zip(*((opj(basedir, val), key[3:]) for (key, val) in info if key.startswith('out')))
+            else:
+                output_indexes = output = []
+            if any(key.startswith('data') for key, val in info):
+                data, data_indexes = zip(*(([attr.strip() for attr in val.split(',')], key[4:]) for (key, val) in info if key.startswith('data')))
+            else:
+                data_indexes = data = []
+            if output_indexes != data_indexes:
+                raise ValueError("Output and data specifications need to be in the same order for %s.\nOne was %s while the other was %s" % (stage, ', '.join(output_indexes), ', '.join(data_indexes)))
+            output = zip(output, data)
+            stages.append(getattr(self.__class__, stage)(self, input=input, output=output))
+
+        self.stages = stages
+        self.tasks = sum((stage.tasks for stage in stages), [])
+        logfile = cfgp.get('logging', 'logfile')
+        self.workers = [Worker(opj(basedir, logfile.format(i=i))) for i in range(worker_count)]
+
+    def _extra_init(self):
+        # Parse config options before creating stages and tasks
+        pass
+
+    def clear_done(self):
+        """
+        .done files are used to incdicate that a task is complete
+        (so that later tasks are able to start, and so that you can
+        restart after a keyboard interrupt without losing all progress)
+
+        Use this function to delete all such files and start from scratch.
+        """
+        for task in self.tasks:
+            for filename in task.donefiles:
+                if ope(filename):
+                    os.unlink(filename)
+
+    def run_serial(self, db=None):
+        if db is None:
+            db = PostgresDatabase()
+        logfile = self.logfile_template.format(i=0)
+        for task in self.tasks:
+            if task.done():
+                print "Already complete " + task.logheader
+            else:
+                print "Starting " + task.logheader
+                task.run(logfile, db)
+
+    def run_parallel(self, worker_count=8):
+        processes = {}
+        pcounter = 0
+        tasks = copy(self.tasks)
+        while tasks or processes:
+            # start processes
+            i = 0
+            while i < len(tasks) and len(processes) < worker_count:
+                if tasks[i].done():
+                    task = tasks.pop(i)
+                    print "Already complete " + task.logheader
+                elif tasks[i].ready():
+                    task = tasks.pop(i)
+                    logfile = self.logfile_template.format(i=pcounter)
+                    P = Process(target=task.run, args=(logfile,))
+                    print "Starting " + task.logheader
+                    P.start()
+                    processes[pcounter] = (P, task)
+                    pcounter += 1
+                else:
+                    i += 1
+            time.sleep(0.1)
+            # finish processes
+            for p, (P, task) in list(processes.items()):
+                if not P.is_alive():
+                    processes.pop(p)
+                    print "Finished " + task.logheader
+
+class IsogenyClasses(Controller):
     """
     This class controls the creation of isogeny classes, grouped by g and q,
     as well as the process of loading and saving them to disk and to the LMFDB
@@ -435,15 +558,14 @@ class IsogenyClasses(object):
     Directories can be relative or absolute, and are indicated by ``__dir__``.
     Data specified within each stage is cumulative.
     """
-    def __init__(self, config=None):
-        if config is None:
-            if os.path.exists('config.ini'):
-                config = os.path.abspath('config.ini')
-            else:
-                raise ValueError("Must have config.ini in directory or specify location")
-        self.config_file = config
-        cfgp = ConfigParser()
-        cfgp.read(config)
+    def __init__(self, worker_count=1, config=None):
+        self.default_cls = IsogenyClass
+        Controller.__init__(self, worker_count, config)
+
+
+    def _extra_init(self):
+        # Parse the extent section
+        cfgp = self.cfgp
         gs = sorted([ZZ(gx[1:]) for gx in cfgp.options('extent')])
         if not gs:
             raise ValueError('Config file must specify [extent] section with lines like "g3=2-16,25"')
@@ -480,93 +602,6 @@ class IsogenyClasses(object):
         # We want to do low q, high g first.  This way we have all the values for a given q,
         # but do the high dimension cases first since these will take the longest.
         self.gq.sort(key=lambda pair: (pair[1], -pair[0]))
-
-        # Create subdirectories if they do not exist
-        self.basedir = basedir = os.path.abspath(os.path.expanduser(cfgp.get('dirs', 'base')))
-        if not ope(basedir):
-            os.makedirs(basedir)
-        subdirs = [sub.strip() for sub in cfgp.get('dirs', 'subdirs').split(',')] + ['logs']
-        for subdir in subdirs:
-            if not ope(opj(basedir, subdir)):
-                os.mkdir(opj(basedir, subdir))
-
-        # Create Stages
-        stages = []
-        self.logfrequency = int(cfgp.get('logging', 'logfrequency'))
-        self.logheader = cfgp.get('logging', 'logheader') + ' '
-        plan = ['Stage'+stage.strip() for stage in cfgp.get('plan', 'stages').split(',')]
-        for stage in plan:
-            if stage not in cfgp.sections():
-                raise ValueError("Missing section %s"%stage)
-            info = [(key, cfgp.get(stage, key)) for key in cfgp.options(stage)]
-            input = [opj(basedir, val) for (key, val) in info if key.startswith('in')]
-            if any(key.startswith('out') for key, val in info):
-                output, output_indexes = zip(*((opj(basedir, val), key[3:]) for (key, val) in info if key.startswith('out')))
-            else:
-                output_indexes = output = []
-            if any(key.startswith('data') for key, val in info):
-                data, data_indexes = zip(*(([attr.strip() for attr in val.split(',')], key[4:]) for (key, val) in info if key.startswith('data')))
-            else:
-                data_indexes = data = []
-            if output_indexes != data_indexes:
-                raise ValueError("Output and data specifications need to be in the same order for %s.\nOne was %s while the other was %s" % (stage, ', '.join(output_indexes), ', '.join(data_indexes)))
-            output = zip(output, data)
-            stages.append(getattr(self.__class__, stage)(self, input=input, output=output))
-
-        self.stages = stages
-        self.tasks = sum((stage.tasks for stage in stages), [])
-        self.logfile_template = cfgp.get('logging', 'logfile')
-
-    def clear_done(self):
-        """
-        .done files are used to incdicate that a task is complete
-        (so that later tasks are able to start, and so that you can
-        restart after a keyboard interrupt without losing all progress)
-
-        Use this function to delete all such files and start from scratch.
-        """
-        for task in self.tasks:
-            for filename in task.donefiles:
-                if ope(filename):
-                    os.unlink(filename)
-
-    def run_serial(self):
-        db = PostgresDatabase()
-        logfile = self.logfile_template.format(i=0)
-        for task in self.tasks:
-            if task.done():
-                print "Already complete " + task.logheader
-            else:
-                print "Starting " + task.logheader
-                task.run(logfile, db)
-
-    def run_parallel(self, worker_count=8):
-        processes = {}
-        pcounter = 0
-        tasks = copy(self.tasks)
-        while tasks or processes:
-            # start processes
-            i = 0
-            while i < len(tasks) and len(processes) < worker_count:
-                if tasks[i].done():
-                    task = tasks.pop(i)
-                    print "Already complete " + task.logheader
-                elif tasks[i].ready():
-                    task = tasks.pop(i)
-                    logfile = self.logfile_template.format(i=pcounter)
-                    P = Process(target=task.run, args=(logfile,))
-                    print "Starting " + task.logheader
-                    P.start()
-                    processes[pcounter] = (P, task)
-                    pcounter += 1
-                else:
-                    i += 1
-            time.sleep(0.1)
-            # finish processes
-            for p, (P, task) in list(processes.items()):
-                if not P.is_alive():
-                    processes.pop(p)
-                    print "Finished " + task.logheader
 
     class StageGenerateSimple(Stage):
         name = 'Generate Simple'
@@ -622,7 +657,7 @@ class IsogenyClasses(object):
                             else:
                                 factors = sum(factors, ())
                             factors = multiplicity_dict(factors).items()
-                            yield IsogenyClass.by_decomposition(factors)
+                            yield IsogenyClass.by_decomposition(factors, db=db)
                 filename, attributes = self.stage.output[0]
                 filename = filename.format(g=self.g, q=self.q)
                 controller.save(filename, make_all(), attributes, t0)
@@ -843,6 +878,7 @@ class IsogenyClasses(object):
                     filename, attributes = self.stage.output[0]
                     filename = filename.format(g=self.g, q=self.q)
                     controller.save(filename, make_all(), attributes, t0)
+
     class StageBasechangeOld(Stage):
         name = 'BasechangeOld'
         shortname = 'BCO'
@@ -935,12 +971,11 @@ class IsogenyClasses(object):
                     outfile = outfile.format(g=self.g, q=self.q)
                     controller.save(outfile, reports, attributes, t0, cls=ValidationReport)
 
-    @staticmethod
-    def load(filename, start=None, stop=None, cls=None, old=False, db=None):
+    def load(self, filename, start=None, stop=None, cls=None, old=False, db=None):
         """
         Iterates over all of the isogeny classes stored in a file.
         The data contained in the file is specified by header lines: the first giving the
-        column names (which are identical to PGType attributes of IsogenyClass)
+        column names (which are identical to PGType attributes of a PGSaver `cls`)
         the second giving postgres types (unused here), and the third blank.
 
         We use ':' as a separator.
@@ -951,11 +986,12 @@ class IsogenyClasses(object):
         - ``start`` -- if not ``None``, the line to start from, indexed so that 0 is
             the first line of data.  Note that this will be the fourth line of the
             file because of the header.
-        - ``stop`` -- if not None``, the first line not to read, indexed as for ``start``.
+        - ``stop`` -- if not None``, the first line not to read, indexed as for ``start``
+        - ``cls`` -- the PGSaver class to load data into
         - ``old`` -- if True, uses 'old_'+attr for attributes in the header if possible
         """
         if cls is None:
-            cls = IsogenyClass
+            cls = self.default_cls
         def fix_attr(attr):
             if old and hasattr(cls, 'old_' + attr):
                 attr = 'old_' + attr
@@ -987,7 +1023,7 @@ class IsogenyClasses(object):
         # if not force and ope(filename):
         #     raise ValueError("File %s already exists"%filename)
         if cls is None:
-            cls = IsogenyClass
+            cls = self.default_cls
         types = [getattr(cls, attr) for attr in attributes]
         header = [':'.join(attributes),
                   ':'.join(attr.pg_type for attr in types),
@@ -1161,9 +1197,14 @@ class IsogenyClass(PGSaver):
 
     @pg_text_old # FIXME once no longer porting
     def label(self):
+        if 'short_curve_counts' in self.__dict__:
+            # We allow specifying q and short_curve_counts
+            Lpoly = self._from_curve_counts() # also sets g
+        else:
+            Lpoly = self.Lpoly
         g, q = self.g, self.q
         return '%s.%s.%s' % (
-            g, q, '_'.join(signed_cremona_letter_code(c) for c in self.Lpoly.list()[1:g+1]))
+            g, q, '_'.join(signed_cremona_letter_code(c) for c in Lpoly.list()[1:g+1]))
 
     @lazy_attribute
     def Ppoly(self):
@@ -1284,6 +1325,30 @@ class IsogenyClass(PGSaver):
         x = S.gen()
         f = S(L)/((1-x)*(1-q*x))
         return f.log().derivative().coefficients()[:prec]
+
+    @pg_numeric_list
+    def short_curve_counts(self):
+        """
+        As for curve_counts, but only of length g.  The intended use
+        is so that you can specify an isogeny class by providing q
+        and these counts.  Note that g is determined by the length of
+        the list, so you cannot provide extra counts.
+        """
+        return self.curve_counts[:self.g]
+
+    def _from_curve_counts(self):
+        """
+        Returns a power series from the value of ``short_curve_counts``
+        whose coefficient match Lpoly up to O(x^(g+1)), and sets ``g``.
+
+        The attributes ``q`` and ``short_curve_counts`` must be set.
+        """
+        q = self.q
+        counts = self.short_curve_counts
+        self.g = g = len(counts)
+        S = PowerSeriesRing(QQ, 'x', g+1)
+        x = S.gen()
+        return S(counts).integral().exp() * (1-x) * (1-q*x)
 
     @lazy_attribute
     def _newpoints(self):
@@ -1529,11 +1594,11 @@ class IsogenyClass(PGSaver):
         g, q, s = self.g, self.q, self.geometric_extension_degree
         return IsogenyClass(Lpoly=base_change(self.Lpoly, s, g=g, q=q), db=self.db).center_dim
 
-    @pg_text
+    @pg_text_list
     def number_fields(self):
         return self._nf_data[0]
 
-    @pg_text
+    @pg_text_list
     def galois_groups(self):
         return self._nf_data[1]
 
@@ -1625,7 +1690,7 @@ class IsogenyClass(PGSaver):
             raise ValueError("Non-simple")
         return self._nf_data[1][0]
 
-    @pg_text
+    @pg_smallint
     def divalg_dim(self):
         return (2*self.g // self.center_dim)^2
 
@@ -2220,96 +2285,3 @@ class ValidationReport(PGSaver):
         raise RuntimeError
     label = pg_text(_dummy)
     report = pg_text(_dummy)
-
-def angle_rank(u,p):
-    """
-    There are two methods for computing this.
-    The first method is to use S-units in sage where S = primes in Q(pi) dividing p.
-    The second method is to use lindep in pari.
-    """
-
-    """
-    K.<a> = u.splitting_field()
-    l = [p] + [i[0] for i in u.roots(K)]
-    S = K.primes_above(p)
-    UGS = UnitGroup(K, S = tuple(S), proof=False)
-    ## Even with proof=False, it is guaranteed to obtain independent S-units; just maybe not the fully saturated group.
-    d = K.number_of_roots_of_unity()
-    gs = [K(i) for i in UGS.gens()]
-    l2 = [UGS(i^d).exponents() for i in l] #For x = a^1b^2c^3 exponents are (1,2,3)
-    for i in range(len(l)):
-        assert(l[i]^d == prod(gs[j]^l2[i][j] for j in range(len(l2[i]))))
-    M = Matrix(l2)
-    return M.rank()-1
-    """
-
-# oldmatcher = re.compile(r"weil-(\d+)-(\d+)\.txt")
-# simplematcher = re.compile(r"weil-simple-g(\d+)-q(\d+)\.txt")
-# allmatcher = re.compile(r"weil-all-g(\d+)-q(\d+)\.txt")
-# LoadedPolyData = namedtuple("LoadedPolyData","label poly angle_numbers p_rank slopes invs places")
-# def load_previous_polys(q = None, g = None, rootdir=None, all = False):
-# #needs the fields to have the proper quotations/other Json formatting.
-#     if rootdir is None:
-#         rootdir = os.path.abspath(os.curdir)
-#     if all:
-#         matcher = allmatcher
-#     else:
-#         matcher = simplematcher
-#     D = defaultdict(list)
-#     R = PolynomialRing(QQ,'x')
-#     def update_dict(D, filename):
-#         with open(filename) as F:
-#             for line in F.readlines():
-#                 data = json.loads(line)
-#                 label, g, q, polynomial, angle_numbers = data[:5]
-#                 p_rank, slopes = data[6:8]
-#                 invs, places = data[13:15]
-#                 D[g,q].append(LoadedPolyData(label, R(polynomial), angle_numbers, p_rank, slopes, invs, places))
-#     if q is not None and g is not None:
-#         filename = "weil-simple-g%s-q%s.txt"%(g, q)
-#         update_dict(D, filename)
-#     else:
-#         for filename in os.listdir(rootdir):
-#             match = matcher.match(filename)
-#             if match:
-#                 gf, qf = map(int,match.groups())
-#                 if q is not None and qf != q:
-#                     continue
-#                 if g is not None and gf != g:
-#                     continue
-#                 update_dict(D, os.path.join(rootdir, filename))
-#     return D
-
-def alternating(pol, m):
-    """
-    This appears to take forever but there is a precomputed version elsewhere.
-    """
-    d = pol.degree()
-    pl = pol.list()
-    e = SymmetricFunctions(QQ).e()
-    dm = binomial(d, m)
-    l = [(-1)^i*e[i](e[m]).restrict_parts(d) for i in range(dm+1)]
-    P = pol.parent()
-    R = P.base_ring()
-    ans = []
-    for i in range(dm,-1,-1):
-        s = R.zero()
-        u = tuple(l[i])
-        for j, c in u:
-            s += R(c) * prod(pl[d-k] for k in j)
-        ans.append(s)
-    return P(ans)
-
-def find_invs_and_slopes(p,r,P):
-    ### KEEPS OLD INVARIANTS BEHAVIOR (doesn't reduce mod Z) ###
-    poly = P.change_ring(QQ)
-    K.<a> = NumberField(poly)
-    l = K.primes_above(p)
-    invs = []
-    slopes = []
-    for v in l:
-        vslope = a.valuation(v)/K(p^r).valuation(v)
-        slopes.append(vslope)
-        vdeg = v.residue_class_degree()*v.ramification_index()
-        invs.append(vslope*vdeg)
-    return invs,slopes

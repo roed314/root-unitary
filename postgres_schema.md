@@ -43,7 +43,6 @@ geometric_center_dim         | smallint   | The dimension of the center of the g
 primitive_models             | text[]     | A list of labels giving primitive models for this isogeny class (ie, this class arises from base change from the model).  If primitive, NULL.
 is_primitive                 | boolean    |
 twists                       | jsonb      | A list of triples `(label, geom_label, r)` where `label` is the label of a twist, `r` is an extension degree where the twists become isomorphic, and `geom_label` is the label of the common base change to that degree.
-
 size                         | integer    | number of isomorphism classes within the isogeny class (isomorphisms of unpolarized abelian varieties)
 ppav_count                   | integer    | number of isomorphism classes of principally polarized abelain varieties within the isogeny class (isomorphisms of polarized abelian varieties)
 jacobian_count               | integer    | number of isomorphism classes of Jacobians within the isogeny class (isomorphisms of polarized abelian varieties)
@@ -81,7 +80,7 @@ galois_group      | text     | The transitive label (e.g. "4T3") for the Galois 
 center_dim        | smallint | The degree of the center over Q
 divalg_dim        | smallint | The dimension of the endomorphism algebra End^0_{q^r}(A) over its center
 places            | text     | A list of lists of rational numbers stored as strings, giving the prime ideals above `p`.  The terms in the outer list correspond to places in the corresponding number field, and each inner list gives coefficients for a two-element generator of that prime ideal (along with `p`) as coefficients of powers of `F`.  They are sorted so that the valuation of `F` is increaasing.
-brauer_invariants | text     | A list of rational numbers stored as strings, giving the Brauer invariants for End^0_{q^r}(A) as a division algebra over its center
+brauer_invariants | text[]   | A list of rational numbers stored as strings, giving the Brauer invariants for End^0_{q^r}(A) as a division algebra over its center
 
 Table name: `av_fq_isom`
 
@@ -93,21 +92,19 @@ label                        | text      | `g.q.weil.enum`, where `g` is the dim
 isom_num                     | integer   | A 0-based enumeration of the isomorphism classes within an isogeny class, TBD
 isom_letter                  | text      | Base 26 a-z encoding of isom_num
 isog_label                   | text      | label for isogeny class
-frac_ideal_numerators        | numeric[] | numerators for a basis for the fractional ideal, expressed in terms of V^{g-1},...,V,1,F,F^2,...,F^g
+isog_power                   | smallint  | When the Weil polynomial is h^r for some squarefree polynomial h, we record r.  If r > 1, require h to be Bass (unable to compute otherwise)
+frac_ideal_numerators        | numeric[] | numerators for a basis for the fractional ideal, expressed in terms of V^{g-1},...,V,1,F,F^2,...,F^g.  NULL if isog_power > 1
 frac_ideal_denominators      | numeric[] | denominators for a basis for the fractional ideal, expressed in terms of V^{g-1},...,V,1,F,F^2,...,F^g.  NULL if all 1.
-over_order                   | text      | isom_letter for over order associated to this ideal MAYBE???
-is_over_order                | boolean   | MAYBE???
-weak_equivalence_class       | text      | label for the weak equivalence class???
+weak_equivalence_class       | text      | isom_letter for the first isom class in this weak equivalence class
 rep_type                     | smallint  | 0=ordinary or Centeleghe-Stix,...
-is_reduced                   | boolean   | Whether the fractional ideal is reduced (HNF, minimal norm, lexicographic within same norm)
-cm_type                      | boolean[] | Whether the +imaginary embedding is a p-adic non-unit, for embeddings sorted by real part
-cm_elt                       | numeric[] | An element of Q[F] that is positive imaginary under each embedding in the CM type
-can_be_principally_polarized | boolean   | Whether this abelian variety has a principal polarization
 rational_invariants          | numeric[] | Invariant factors of A(F_q)
 is_product                   | boolean   | Whether this isomorphism class is a product of smaller dimensional abelian varieties
+power_product_factorization  | text[]    | If isog_power > 1, list of isom_letters corresponding to a direct sum decomposition S_1 + S_2 + ... + I_r in the isogeny class corresponing to the polynomial h.  Here S_i is an order and (I_r:I_r) >= S_{r-1}.
 product_factorization        | jsonb     | List of pairs (label, e) expressing this as a product of smaller dimensional abelian varities (NULL if not)
-endo_ring                    | jsonb     | Some kind of description....
-related_objects              | text[]    | List of URLs
+endo_ring                    | text      | The isom_letter for the isomorphism class which is the endomorphism ring (NULL when isog_power != 1)
+related_objects              | text[]    | List of URLs (null for now)
+can_be_principally_polarized | boolean   | Whether this abelian variety has a principal polarization (null for now)
+is_reduced                   | boolean   | Whether the fractional ideal is reduced (HNF, minimal norm, lexicographic within same norm) (add later)
 
 
 Table name: `av_fq_pol`
@@ -123,6 +120,8 @@ degree              | smallint   | degree of the polarization
 kernel              | smallint[] | invariant factors for the kernel of the isogeny (cokernel of the map of lattices)
 is_decomposable     | boolean    | Whether this polarized abelian variety is a product
 decomposition       | jsonb      | List of pairs (label, e) expressing this polarized abelian variety as a product (NULL if not)
+cm_type             | boolean[]  | Whether the +imaginary embedding is a p-adic non-unit, for embeddings sorted by real part
+cm_elt              | numeric[]  | An element of Q[F] that is positive imaginary under each embedding in the CM type
 aut_group           | text       | GAP id
 geom_aut_group      | text       | GAP id
 is_hyperelliptic    | boolean    |
