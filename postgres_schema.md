@@ -43,7 +43,6 @@ geometric_center_dim         | smallint   | The dimension of the center of the g
 primitive_models             | text[]     | A list of labels giving primitive models for this isogeny class (ie, this class arises from base change from the model).  If primitive, NULL.
 is_primitive                 | boolean    |
 twists                       | jsonb      | A list of triples `(label, geom_label, r)` where `label` is the label of a twist, `r` is an extension degree where the twists become isomorphic, and `geom_label` is the label of the common base change to that degree.
-
 size                         | integer    | number of isomorphism classes within the isogeny class (isomorphisms of unpolarized abelian varieties)
 ppav_count                   | integer    | number of isomorphism classes of principally polarized abelain varieties within the isogeny class (isomorphisms of polarized abelian varieties)
 jacobian_count               | integer    | number of isomorphism classes of Jacobians within the isogeny class (isomorphisms of polarized abelian varieties)

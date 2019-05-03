@@ -727,7 +727,7 @@ class IsogenyClasses(Controller):
                 filename, attributes = self.stage.output[0]
                 filename = filename.format(g=self.g, q=selfq)
                 controller.save(filename, make_all(), attributes)
-    class Stage BasechangeOld(Stage):
+    class StageBasechangeOld(Stage):
         name = 'BasechangeOld'
         shortname = 'BCO'
         @lazy_attribute
@@ -977,9 +977,14 @@ class IsogenyClass(PGSaver):
 
     @pg_text_old # FIXME once no longer porting
     def label(self):
+        if 'short_curve_counts' in self.__dict__:
+            # We allow specifying q and short_curve_counts
+            Lpoly = self._from_curve_counts() # also sets g
+        else:
+            Lpoly = self.Lpoly
         g, q = self.g, self.q
         return '%s.%s.%s' % (
-            g, q, '_'.join(signed_cremona_letter_code(c) for c in self.Lpoly.list()[1:g+1]))
+            g, q, '_'.join(signed_cremona_letter_code(c) for c in Lpoly.list()[1:g+1]))
 
     @lazy_attribute
     def Ppoly(self):
@@ -1100,6 +1105,30 @@ class IsogenyClass(PGSaver):
         x = S.gen()
         f = S(L)/((1-x)*(1-q*x))
         return f.log().derivative().coefficients()[:prec]
+
+    @pg_numeric_list
+    def short_curve_counts(self):
+        """
+        As for curve_counts, but only of length g.  The intended use
+        is so that you can specify an isogeny class by providing q
+        and these counts.  Note that g is determined by the length of
+        the list, so you cannot provide extra counts.
+        """
+        return self.curve_counts[:self.g]
+
+    def _from_curve_counts(self):
+        """
+        Returns a power series from the value of ``short_curve_counts``
+        whose coefficient match Lpoly up to O(x^(g+1)), and sets ``g``.
+
+        The attributes ``q`` and ``short_curve_counts`` must be set.
+        """
+        q = self.q
+        counts = self.short_curve_counts
+        self.g = g = len(counts)
+        S = PowerSeriesRing(QQ, 'x', g+1)
+        x = S.gen()
+        return S(counts).integral().exp() * (1-x) * (1-q*x)
 
     @lazy_attribute
     def _newpoints(self):
