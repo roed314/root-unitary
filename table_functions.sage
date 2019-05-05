@@ -39,6 +39,7 @@ from itertools import combinations_with_replacement, imap, izip_longest
 from ConfigParser import ConfigParser
 from lmfdb.backend.database import PostgresDatabase
 from psycopg2.sql import SQL, Identifier, Literal
+from cypari2.handle_error import PariError
 
 int_re = re.compile(r'-?\d+')
 
@@ -201,11 +202,11 @@ def signed_cremona_letter_code(m):
 
 def signed_class_to_int(code):
     if code == 'a':
-        return 0r
+        return ZZ(0)
     elif code.startswith('a'):
-        return -class_to_int(code[1:])
+        return -ZZ(class_to_int(code[1:]))
     else:
-        return class_to_int(code)
+        return ZZ(class_to_int(code))
 
 # The following classes support nicely loading and saving
 # to disk in a format readable by postgres
@@ -765,7 +766,7 @@ class IsogenyClasses(Controller):
         shortname = 'Combo'
         class Task(GenericTask):
             def run(self, logfile, db=None):
-                if db is None: db = PostgresDatabase()
+                # db isn't needed for Combine, since number_field and galois_group should already be present
                 t0 = datetime.utcnow()
                 stage = self.stage
                 controller = stage.controller
@@ -970,6 +971,20 @@ class IsogenyClasses(Controller):
                     outfile, attributes = self.stage.output[0]
                     outfile = outfile.format(g=self.g, q=self.q)
                     controller.save(outfile, reports, attributes, t0, cls=ValidationReport)
+    class StagePolyOut(Stage):
+        name = 'PolyOut'
+        shortname = 'PolyOut'
+        class Task(GenericTask):
+            def run(self, logfile, db=None):
+                # db isn't needed since we're just outputting the poly from loaded data
+                t0 = datetime.utcnow()
+                stage = self.stage
+                controller = stage.controller
+                if (self.g == 1 and self.q > 499) or (self.g == 2 and self.q > 211) or (self.g == 3 and self.q > 13):
+                    infile = self.input_data[0][1]
+                    outfile, attributes = self.stage.output[0]
+                    outfile = outfile.format(g=self.g, q=self.q)
+                    controller.save(outfile, controller.load(infile), attributes, t0)
 
     def load(self, filename, start=None, stop=None, cls=None, old=False, db=None):
         """
@@ -1164,10 +1179,10 @@ class IsogenyClass(PGSaver):
             self.poly = poly
         if label is not None:
             self.label = label
-        if db is None:
-            # Since we're multiprocessing we need a new database connection for each process
-            raise RuntimeError
-            db = PostgresDatabase()
+        #if db is None:
+        #    # Since we're multiprocessing we need a new database connection for each process
+        #    raise RuntimeError
+        #    db = PostgresDatabase()
         self.db = db
         # One of the gotchas of lazy_attributes is that hasattr triggers the computation,
         # so we have to store the existence of the decomposition in a separate variable.
@@ -1188,7 +1203,7 @@ class IsogenyClass(PGSaver):
         self.g = g = ZZ(g)
         self.q = q = ZZ(q)
         coeffs = map(signed_class_to_int, coeffs.split('_'))
-        coeffs = [1] + coeffs + [q^i * c for (i, c) in enumerate(reversed(coeffs[:-1]), 1)] + [q^g]
+        coeffs = [ZZ(1)] + coeffs + [q^i * c for (i, c) in enumerate(reversed(coeffs[:-1]), 1)] + [q^g]
         return coeffs
 
     @lazy_attribute
@@ -1288,7 +1303,7 @@ class IsogenyClass(PGSaver):
 
     @lazy_attribute
     def real_Lpoly(self):
-        return self._real_poly(self.Lpoly, self.g, self.q)
+        return self.real_Ppoly.reverse()
 
     @lazy_attribute
     def real_Ppoly(self):
@@ -1649,10 +1664,15 @@ class IsogenyClass(PGSaver):
         square = tensor_charpoly(Lpoly,Lpoly)(x/q)
 
         fieldext = ZZ(1)
-        for factor, power in square.factor():
-            m = Cyclotomic().order(factor)
-            if m > 0:
-                fieldext = fieldext.lcm(m)
+        try:
+            for factor, power in square.factor():
+                m = Cyclotomic().order(factor)
+                if m > 0:
+                    fieldext = fieldext.lcm(m)
+        except PariError:
+            print self.label
+            print square
+            raise
 
         return fieldext
 
@@ -1761,21 +1781,33 @@ class IsogenyClass(PGSaver):
             # Every odd-dimensional simple isogeny class has a principal polarization
             return 1r
         elif self.is_simple:
-            plus_poly = self.real_Lpoly
+            # We need to take radicals since the Ppoly could be a power of an irreducible
+            plus_poly = self.real_Ppoly.radical()
             # Look at the CM field K and its real subfield K+.
             # If K/K+ is ramified at a finite prime, or if there is a prime of K+
             # that divides F - V and that is inert in K/K+,
             # then there's a principally polarized variety in the isogeny class.
-            poly = plus_poly.parent()(coeffs)
-            K.<F> = NumberField(poly)
-            Kplus.<Fplus> = NumberField(plus_poly)
+            poly = self.Ppoly.radical()
+            try:
+                K.<F> = NumberField(poly)
+                Kplus.<Fplus> = NumberField(plus_poly)
+            except ValueError:
+                print self.label
+                print poly.factor()
+                print plus_poly.factor()
+                raise
             D = K.discriminant()
             Dplus = Kplus.discriminant()
             if D.abs() != Dplus^2:
                 return 1r
             V = q / F
             # F -> V is complex conjugation
-            conj = K.hom([V])
+            try:
+                conj = K.hom([V])
+            except TypeError:
+                print self.label
+                print poly
+                raise
             for PP, e in K.ideal(F - V).factor():
                 # Being inert in K/K+ is the same as being equal to the complex conjugate
                 if PP == PP.apply_morphism(conj):
@@ -2285,3 +2317,15 @@ class ValidationReport(PGSaver):
         raise RuntimeError
     label = pg_text(_dummy)
     report = pg_text(_dummy)
+
+def combine_polys():
+    basedir = '/scratch/importing/avfq/polys/'
+    for g in [1,2,3]:
+        with open(opj(basedir, 'weil_poly_g%s.txt'%g), 'w') as Fout:
+            for q in [16,25,243,256,343,512,625,729,1024]:
+                infile = opj(basedir, 'weil_poly_g%s_q%s.txt' % (g, q))
+                if ope(infile):
+                    with open(infile) as Fin:
+                        for i, line in enumerate(Fin):
+                            if i > 2:
+                                Fout.write(line)
