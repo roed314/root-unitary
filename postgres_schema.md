@@ -91,11 +91,11 @@ Representatives for the weak equivalence classes
 
 Column                       | Type      | Notes
 -----------------------------|-----------|------
-label
+label                        | text      | 
 we_number                    | smallint  | enumeration of the weak equivalence classes within a given isogeny class
 pic_size                     | integer   | Size of Pic(S)
 multiplicator_ring           | text      | label for the multiplicator ring S
-isog_label
+isog_label                   | text      | label for the isogeny class
 ideal_basis                  | numeric[] | Z-basis for the chosen representative of weak equivalence class
 is_invertible                | boolean   | Invertible in its multiplicator ring
 inverting_element            | numeric[] | When invertible, an element x so that I/x is the ring (null if not invertible), expressed in terms of `V^g,...,V,1,F,F^2,...,F^{g-1}`
@@ -124,14 +124,13 @@ isom_num                     | integer   | A 0-based enumeration of the isomorph
 isom_letter                  | text      | Base 26 a-z encoding of isom_num
 isog_label                   | text      | label for isogeny class
 isog_power                   | smallint  | When the Weil polynomial is h^r for some squarefree polynomial h, we record r.  If r > 1, require h to be Bass (unable to compute otherwise)
-ideal_basis                  | numeric[] | a basis for the integral ideal, expressed in terms of `V^g,...,V,1,F,F^2,...,F^{g-1}`.  NULL if isog_power > 1
-weak_equivalence_class       | text      | isom_letter for the first isom class in this weak equivalence class
+weak_equivalence_class       | smallint  | The `we_number` for the row in the weak equivalence class table
+endo_ring                    | smallint  | The `we_number` for the row in the weak equivalence class table corresponding to the endomorphism ring (NULL when isog_power != 1)
 rep_type                     | smallint  | 0=ordinary or Centeleghe-Stix,...
 rational_invariants          | numeric[] | Invariant factors of A(F_q)
 is_product                   | boolean   | Whether this isomorphism class is a product of smaller dimensional abelian varieties
 power_product_factorization  | text[]    | If isog_power > 1, list of isom_letters corresponding to a direct sum decomposition S_1 + S_2 + ... + I_r in the isogeny class corresponing to the polynomial h.  Here S_i is an order and (I_r:I_r) >= S_{r-1}.
 product_factorization        | jsonb     | List of pairs (label, e) expressing this as a product of smaller dimensional abelian varities (NULL if not)
-endo_ring                    | text      | The isom_letter for the isomorphism class which is the endomorphism ring (NULL when isog_power != 1)
 related_objects              | text[]    | List of URLs (null for now)
 principal_polarizations      | smallint  | The number of principal polarizations (null if unknown)
 is_reduced                   | boolean   | Whether the fractional ideal is reduced (HNF, minimal norm, lexicographic within same norm) (add later)
