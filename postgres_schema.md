@@ -96,7 +96,8 @@ we_number                    | smallint  | enumeration of the weak equivalence c
 pic_size                     | integer   | Size of Pic(S)
 multiplicator_ring           | text      | label for the multiplicator ring S
 isog_label                   | text      | label for the isogeny class
-ideal_basis                  | numeric[] | Z-basis for the chosen representative of weak equivalence class
+ideal_basis_numerators       | numeric[] | Z-basis for the chosen representative of weak equivalence class, after scaling by the denominator
+ideal_basis_denominator      | numeric   | denominator for coefficients in the Z-basis (will be a divisor of the index of the Frobenius order in the maximal order)
 is_invertible                | boolean   | Invertible in its multiplicator ring
 inverting_element            | numeric[] | When invertible, an element x so that I/x is the ring (null if not invertible), expressed in terms of `V^g,...,V,1,F,F^2,...,F^{g-1}`
 minimal_overorders           | smallint[] | list of `we_numbers` for minimal overorders
@@ -109,7 +110,8 @@ Column                       | Type      | Notes
 -----------------------------|-----------|------
 generator_number             | smallint  | Which generator
 multiplicator_ring           | text      | Label for the multiplicator ring S in the weak equivalence classes table
-ideal_basis                  | numeric[] | Z-basis for this ideal
+ideal_basis_numerators       | numeric[] | Z-basis for this ideal, after scaling by the denominator
+ideal_basis_denominator      | numeric   | denominator for coefficients in the Z-basis (will be a divisor of the index of the Frobenius order in the multiplicator ring)
 multiplicative order         | integer   | multiplicative order in Pic(S)
 
 
