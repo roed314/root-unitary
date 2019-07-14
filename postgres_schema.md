@@ -26,6 +26,7 @@ angle_rank                   | smallint   | The dimension of the Q-span of the a
 slopes                       | text[]     | The sorted list of slopes, as string representations of rational numbers.  Duplicated slopes will have "A", "B", etc appended.
 abvar_counts                 | numeric[]  | The list of counts `#A(F_{q^i})` for `i=1..10`, for `A` in this isogeny class
 abvar_counts_str             | text       | A space separated string of abelian variety counts, for searching
+abvar_count                  | numeric    | The count `#A(F_q)`, duplicated for searching purposes
 curve_counts                 | numeric[]  | The list of curve counts `#C(F_{q^i})` for `i=1..10` for any curve `C` of genus `g` with `J(C)` in this isogeny class
 curve_counts_str             | text       | A space separated string of curve counts, for searching
 curve_count                  | integer    | The count `#C(F_q)`, duplicated for searching purposes
@@ -56,6 +57,8 @@ zfv_plus_norm                | numeric    | The absolute value of the norm of F-
 isogeny_graphs               | jsonb      | list of pairs `(p, G)`, where `p` is a degree (or maybe list of degrees) and `G` is a list of pairs `(u,v)` representing the directed edge from `u` to `v`.  Each of `u` and `v` is the `isom_letter` for the corresponding isogeny class
 ideal_class_generators       | text[]     | A list of `isom_letters` for isomorphism classes that generate the ideal monoid
 ideal_class_relations        | integer[]  | A matrix of positive integers giving relations between the ideal class generators
+cm_type             | boolean[]  | Whether the +imaginary embedding is a p-adic non-unit, for embeddings sorted by real part
+cm_elt              | numeric[]  | An element of Q[F] that is positive imaginary under each embedding in the CM type
 
 Table name: `av_fq_endalg_factors`
 
@@ -82,9 +85,39 @@ divalg_dim        | smallint | The dimension of the endomorphism algebra End^0_{
 places            | text     | A list of lists of rational numbers stored as strings, giving the prime ideals above `p`.  The terms in the outer list correspond to places in the corresponding number field, and each inner list gives coefficients for a two-element generator of that prime ideal (along with `p`) as coefficients of powers of `F`.  They are sorted so that the valuation of `F` is increaasing.
 brauer_invariants | text[]   | A list of rational numbers stored as strings, giving the Brauer invariants for End^0_{q^r}(A) as a division algebra over its center
 
+Table name: `av_fq_weak_equivalences`
+
+Representatives for the weak equivalence classes
+
+Column                       | Type      | Notes
+-----------------------------|-----------|------
+label                        | text      | 
+we_number                    | smallint  | enumeration of the weak equivalence classes within a given isogeny class
+pic_size                     | integer   | Size of Pic(S)
+multiplicator_ring           | text      | label for the multiplicator ring S
+isog_label                   | text      | label for the isogeny class
+ideal_basis_numerators       | numeric[] | Z-basis for the chosen representative of weak equivalence class, after scaling by the denominator
+ideal_basis_denominator      | numeric   | denominator for coefficients in the Z-basis (will be a divisor of the index of the Frobenius order in the maximal order)
+is_invertible                | boolean   | Invertible in its multiplicator ring
+inverting_element            | numeric[] | When invertible, an element x so that I/x is the ring (null if not invertible), expressed in terms of `V^g,...,V,1,F,F^2,...,F^{g-1}`
+minimal_overorders           | smallint[] | list of `we_numbers` for minimal overorders
+
+Table name: `av_fq_pic`
+
+Rows give representatives for generators of Pic(S) as S ranges over multiplicator rings
+
+Column                       | Type      | Notes
+-----------------------------|-----------|------
+generator_number             | smallint  | Which generator
+multiplicator_ring           | text      | Label for the multiplicator ring S in the weak equivalence classes table
+ideal_basis_numerators       | numeric[] | Z-basis for this ideal, after scaling by the denominator
+ideal_basis_denominator      | numeric   | denominator for coefficients in the Z-basis (will be a divisor of the index of the Frobenius order in the multiplicator ring)
+multiplicative order         | integer   | multiplicative order in Pic(S)
+
+
 Table name: `av_fq_isom`
 
-This table represents unpolarized abelian varieties, up to isomorphism.
+This table represents unpolarized abelian varieties, up to isomorphism.  It would be nice to give the lattice of polarizations (dimension should be the rank of the endomorphism algebra over the base field).  Minimal polarization degree is generalization of `can_be_principally_polarized`.  Are there local invariants (of the weak equivalence class) that have consequences for the abelian variety?
 
 Column                       | Type      | Notes
 -----------------------------|-----------|------
@@ -93,17 +126,15 @@ isom_num                     | integer   | A 0-based enumeration of the isomorph
 isom_letter                  | text      | Base 26 a-z encoding of isom_num
 isog_label                   | text      | label for isogeny class
 isog_power                   | smallint  | When the Weil polynomial is h^r for some squarefree polynomial h, we record r.  If r > 1, require h to be Bass (unable to compute otherwise)
-frac_ideal_numerators        | numeric[] | numerators for a basis for the fractional ideal, expressed in terms of V^{g-1},...,V,1,F,F^2,...,F^g.  NULL if isog_power > 1
-frac_ideal_denominators      | numeric[] | denominators for a basis for the fractional ideal, expressed in terms of V^{g-1},...,V,1,F,F^2,...,F^g.  NULL if all 1.
-weak_equivalence_class       | text      | isom_letter for the first isom class in this weak equivalence class
+weak_equivalence_class       | smallint  | The `we_number` for the row in the weak equivalence class table
+endo_ring                    | smallint  | The `we_number` for the row in the weak equivalence class table corresponding to the endomorphism ring (NULL when isog_power != 1)
 rep_type                     | smallint  | 0=ordinary or Centeleghe-Stix,...
 rational_invariants          | numeric[] | Invariant factors of A(F_q)
 is_product                   | boolean   | Whether this isomorphism class is a product of smaller dimensional abelian varieties
 power_product_factorization  | text[]    | If isog_power > 1, list of isom_letters corresponding to a direct sum decomposition S_1 + S_2 + ... + I_r in the isogeny class corresponing to the polynomial h.  Here S_i is an order and (I_r:I_r) >= S_{r-1}.
 product_factorization        | jsonb     | List of pairs (label, e) expressing this as a product of smaller dimensional abelian varities (NULL if not)
-endo_ring                    | text      | The isom_letter for the isomorphism class which is the endomorphism ring (NULL when isog_power != 1)
 related_objects              | text[]    | List of URLs (null for now)
-can_be_principally_polarized | boolean   | Whether this abelian variety has a principal polarization (null for now)
+principal_polarizations      | smallint  | The number of principal polarizations (null if unknown)
 is_reduced                   | boolean   | Whether the fractional ideal is reduced (HNF, minimal norm, lexicographic within same norm) (add later)
 
 
@@ -120,8 +151,6 @@ degree              | smallint   | degree of the polarization
 kernel              | smallint[] | invariant factors for the kernel of the isogeny (cokernel of the map of lattices)
 is_decomposable     | boolean    | Whether this polarized abelian variety is a product
 decomposition       | jsonb      | List of pairs (label, e) expressing this polarized abelian variety as a product (NULL if not)
-cm_type             | boolean[]  | Whether the +imaginary embedding is a p-adic non-unit, for embeddings sorted by real part
-cm_elt              | numeric[]  | An element of Q[F] that is positive imaginary under each embedding in the CM type
 aut_group           | text       | GAP id
 geom_aut_group      | text       | GAP id
 is_hyperelliptic    | boolean    |
