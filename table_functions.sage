@@ -300,7 +300,7 @@ class Cyclotomic(UniqueRepresentation):
     # Convention: phi(m) = n
     def __init__(self):
         self.polynomials = {}
-        self.mbound = 1
+        self.mbound = 0
         self.nbound = 0
     def order(self, f):
         """
@@ -312,7 +312,7 @@ class Cyclotomic(UniqueRepresentation):
         return self.polynomials.get(f, 0)
     def get_mbound(self, nbound):
         """
-        
+        Returns an integer `mbound` so that if `n <= nbound` and `n = Phi(m)` then `m < mbound`.
         """
         # https://math.stackexchange.com/questions/265397/inversion-of-the-euler-totient-function
         steps = 0
@@ -322,8 +322,11 @@ class Cyclotomic(UniqueRepresentation):
             steps += 1
         return 2 * 3^steps
     def compute(self, nbound):
+        """
+        Adds cyclotomic polynomials to the cache, including all of degree less than `nbound`.
+        """
         mbound = self.get_mbound(nbound)
-        for m in range(self.mbound, mbound):
+        for m in range(self.mbound+1, mbound+1):
             self.polynomials[cyclotomic_polynomial(m)] = m
         self.nbound = nbound
         self.mbound = mbound
@@ -891,8 +894,8 @@ class IsogenyClasses(Controller):
                         base_class.geometric_center_dim = extension_class.center_dim
                         base_class.is_geometrically_simple = extension_class.is_simple
                         for m in range(1, 6):
-                            setattr(base_class, 'geom_dim%s_factors', sum(mult for simple_factor, mult in extension_class.decomposition if simple_factor.g == m))
-                            setattr(base_class, 'geom_dim%s_distinct', len([mult for simple_factor, mult in extension_class.decomposition if simple_factor.g == m]))
+                            setattr(base_class, 'geom_dim%s_factors'%m, sum(mult for simple_factor, mult in extension_class.decomposition if simple_factor.g == m))
+                            setattr(base_class, 'geom_dim%s_distinct'%m, len([mult for simple_factor, mult in extension_class.decomposition if simple_factor.g == m]))
                 for r, ICs in in_db.items():
                     self.log("Base changing r=%s; memory %s" % (r, process.memory_info()[0]))
                     lcms = pair_lcms[r]
@@ -904,9 +907,6 @@ class IsogenyClasses(Controller):
                             base_changes[BC][r].append(IC)
                             if geom_degree % s == 0:
                                 compute_endomorphism_algebra(BC, IC, s)
-                                if s == geom_degree:
-                                    # record some geometric data
-                                    IC.geometric_center_dim = BC.center_dim
                         for s in geom_degree.divisors():
                             if s not in lcms:
                                 BC = IsogenyClass(Lpoly=base_change(IC.Lpoly, s, g=g, q=q), db=db)
@@ -960,6 +960,112 @@ class IsogenyClasses(Controller):
                     else:
                         self.log("Saving bc isogeny classes r=%s; %s total, memory %s" % (r, len(in_db[r]), process.memory_info()[0]))
                         controller.save(filename, in_db[r].values(), attributes, self.t0)
+    class StageFixBasechange(Stage):
+        name = 'FixBasechange'
+        shortname = 'FixBC'
+        @lazy_attribute
+        def tasks(self):
+            return [self.Task(g, q, self) for g, q in self.controller.gq if q.is_prime()]
+
+        class Task(GenericTask):
+            def __init__(self, g, p, stage):
+                self.g, self.p, self.stage = g, p, stage
+                self.logheader = stage.controller.logheader.format(g=g, q=p, name=stage.shortname)
+                self.qs = [q for (g, q) in stage.controller.gq if g == self.g and q%p == 0]
+                self.rs = [q.is_prime_power(get_data=True)[1] for q in self.qs]
+
+            def _logdata(self):
+                return '_%s_%s' % (self.g, self.p)
+            @lazy_attribute
+            def input_data(self):
+                # input = av_fq_endalg_factors(p), av_fq_endalg_data(p), weil_basechange(q), weil_all(q)
+                return ([(None, self.stage.input[0].format(g=self.g, p=self.p)),
+                         (None, self.stage.input[1].format(g=self.g, p=self.p))] +
+                        [(r, self.stage.input[2].format(g=self.g, q=q)) for q, r in zip(self.qs, self.rs)] +
+                        [(r, self.stage.input[3].format(g=self.g, q=q)) for q, r in zip(self.qs, self.rs)])
+            @lazy_attribute
+            def output_data(self):
+                outputs = []
+                for i, (filename, attributes) in enumerate(self.stage.output):
+                    if i < 2:
+                        # We use r=0 and r=-1 to encode the output files for endomorphism alg data
+                        outputs.append((-i, filename.format(g=self.g, p=self.p), attributes))
+                    else:
+                        for r in self.rs:
+                            outputs.append((r, filename.format(g=self.g, q=self.p^r), attributes))
+                return outputs
+            @lazy_attribute
+            def donefiles(self):
+                return [self._done(filename) for r, filename, attributes in self.output_data]
+
+            def run(self, db=None):
+                # Need to fix the following issues:
+                #  - correct geometric_extension_degree in a small list of cases, add the corresponding records to endalg_factors and endalg_data, fix geometric_center_dim and is_geometrically_simple and twists
+                #  - set geom_distinct%d and geom_factors%d and is_geometrically_simple when not present using endalg_factors
+                #  - add has_geom_ss_factor using endalg_factors and endalg_data
+                #  - add geometric_number_fields, geometric_galois_groups using endalg_data
+                #  - add max_twist_degree from twists
+                #  - twist presentation of places to the polredabs polynomial
+                # and backport to StageBasechange
+                process = psutil.Process(os.getpid())
+                stage = self.stage
+                controller = stage.controller
+                g, p = self.g, self.p
+                self.log("Loading inputs; memory %s" % (process.memory_info()[0]))
+                endalg_factors, endalg_data = self.input_data[:2]
+                weil_basechange = self.input_data[2:2+len(self.rs)]
+                weil_all = self.input_data[2+len(self.rs):]
+                multiplicity_records = controller.load(endalg_factors, cls=BaseChangeRecord, db=db)
+                simple_factors = {IC.label: IC for IC in controller.load(endalg_data, db=db)}
+                weil_basechange = {r: {IC.label: IC for IC in controller.load(filename, db=db)} for (r, filename) in weil_basechange}
+                weil_all = {r: {IC.label: IC for IC in controller.load(filename, db=db)} for (r, filename) in weil_all}
+                in_db = {r: {lab: IsogenyClass.combine([weil_basechange[r][lab], weil_all[r][lab]], db=db) for lab in weil_all[r].keys()} for r in self.rs}
+                def compute_endomorphism_algebra(extension_class, base_class, extension_degree):
+                    for simple_factor, mult in extension_class.decomposition:
+                        SFL = simple_factor.label
+                        BCR = BaseChangeRecord(base_class.label, SFL, extension_degree, mult)
+                        multiplicity_records.append(BCR)
+                        if SFL not in simple_factors:
+                            simple_factors[SFL] = simple_factor
+                # 1.3.ad 1 6
+                # 1.3.d 1 6
+                # 1.13.a 1 2
+                # 1.27.aj 1 6
+                # 1.27.j 1 6
+                # 1.151.a 1 2
+                # 1.223.a 1 2
+                # 1.243.abb 1 6
+                # 1.243.bb 1 6
+                # 1.443.a 1 2
+                # 2.2.ad_f 1 6
+                # 2.3.f_m 1 6
+                # 2.61.ak_es 1 2
+                # 4.2.a_b_b_ae 1 2
+                if g == 1 and p in [3, 13, 151, 223, 443] or g == 2 and p in [2, 3, 61] or g == 4 and p == 2:
+                    print "Fixing g=%s, p=%s"
+                    if g == 1 and p == 3:
+                        rL = [1, 3, 5]
+                    else:
+                        rL = [1]
+                    geometric_degrees = defaultdict(set)
+                    pair_lcms = defaultdict(set)
+                    for r in rL:
+                        q = p^r
+                        for IC in in_db[r].values():
+                            # fix geometric_extension_degree
+                            old = IC.__dict__.pop('geometric_extension_degree')
+                            new = IC.geometric_extension_degree
+                            geometric_degrees[r].add(new)
+                            if old != new:
+                                for s in new.divisors():
+                                    if s > 1:
+                                        BC = IsogenyClass(Lpoly=base_change(IC.Lpoly, s, g=g, q=q), db=db)
+                                        compute_endomorphism_algebra(BC, IC, s)
+                                        # Don't have to update primitivity
+                        # Have to recompute all twists, so need corrected pair_lcms
+                        for a, b in Combinations(geometric_degrees[r], 2):
+                            pair_lcms[r].add(lcm(a,b))
+                        
     class StageFixEndalgData(Stage):
         name = 'FixEndalgData'
         shortname = 'FixEndalg'
@@ -1861,6 +1967,12 @@ class IsogenyClass(PGSaver):
         # set by base change
         g, q, s = self.g, self.q, self.geometric_extension_degree
         return IsogenyClass(Lpoly=base_change(self.Lpoly, s, g=g, q=q), db=self.db).is_simple
+
+    #@pg_boolean
+    #def has_geom_ss_factor(self):
+    #    # set by base change
+    #    g, q, s = self.g, self.q, self.geometric_extension_degree
+    #
 
     @pg_text_list
     def simple_distinct(self):
