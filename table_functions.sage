@@ -269,8 +269,9 @@ def base_change(Lpoly, r, algorithm=None, g = None, q = None, prec=53):
         approx_coeffs = approx.list()
         acceptable_error = R(2)^-(prec//2)
         exact_coeffs = [c.real().round() for c in approx_coeffs]
-        if max(abs(ap - ex) for ap, ex in zip(approx_coeffs, exact_coeffs)) > acceptable_error:
-            raise RuntimeError
+        actual_error = max(abs(ap - ex) for ap, ex in zip(approx_coeffs, exact_coeffs))
+        if actual_error > acceptable_error:
+            raise RuntimeError(actual_error)
         return Lpoly.parent()(exact_coeffs)
     elif algorithm == 'linalg':
         # From https://github.com/edgarcosta/endomorphisms/blob/master/endomorphisms/OverFiniteField/utils.py
@@ -351,7 +352,27 @@ def signed_class_to_int(code):
 # to disk in a format readable by postgres
 
 class PGType(lazy_attribute):
+    """
+    An extension of a lazy_attribute that decorates an attribute with a postgres type
+    and provides mechanisms for writing to and loading from a file.
+
+    INPUT:
+
+    - ``func`` -- a function for computing the attribute
+    - ``internal`` -- boolean (default False), whether this attribute is an intermediate result
+        and not stored in the final file.
+    """
     check=None # bound for integer types
+    def __init__(self, func=None, internal=False):
+        if func is None:
+            self.internal = internal
+        else:
+            if not hasattr(self, 'internal'):
+                self.internal = False
+            self(func)
+    def __call__(self, func):
+        lazy_attribute.__init__(self, func)
+        return self
     def _load(self, x):
         """
         Wraps :meth:`load` for the appropriate handling of NULLs.
@@ -496,46 +517,6 @@ class pg_rational_list(_rational_list):
 class pg_rational_mults(_rational_mults):
     pg_type = 'text[]'
 class pg_jsonb(PGType):
-    pg_type = 'jsonb'
-
-class PGOld(PGType):
-    """
-    Columns from the current LMFDB schema.
-
-    Even if the column name and type hasn't changed,
-    it's still useful to use this class so that StageDBLoad works correctly.
-    """
-    def __init__(self, func=None, new_name=None, switch=(lambda x,db:x)):
-        if func is None:
-            self.new_name = new_name
-            self.switch = switch
-        else:
-            if not hasattr(self, 'new_name'):
-                self.new_name = None
-            if not hasattr(self, 'switch'):
-                self.switch = lambda x,db: x
-            self(func)
-    def __call__(self, func):
-        PGType.__init__(self, func)
-        if self.__name__.startswith('old_'):
-            self.__name__ = self.__name__[4:]
-        if self.new_name is None:
-            self.new_name = self.__name__
-        return self
-
-class pg_text_old(pg_text, PGOld):
-    pass
-class pg_smallint_old(pg_smallint, PGOld):
-    pass
-class pg_integer_old(pg_integer, PGOld):
-    pass
-class pg_jsonb_old(pg_jsonb, PGOld): # More specific when using rationals??
-    pass
-class pg_boolean_old(pg_boolean, PGOld):
-    pass
-class pg_rational_list_old(_rational_list, PGOld):
-    pg_type = 'jsonb'
-class pg_rational_mults_old(_rational_mults, PGOld):
     pg_type = 'jsonb'
 
 class Stage(object):
@@ -774,6 +755,9 @@ class IsogenyClasses(Controller):
         self.gq.sort(key=lambda pair: (pair[1], -pair[0]))
 
     class StageGenerateSimple(Stage):
+        """
+        Generate the simple isogeny classes for each g,q using the WeilPolynomials iterator
+        """
         name = 'Generate Simple'
         shortname = 'GenSimp'
         class Task(GenericTask):
@@ -789,6 +773,7 @@ class IsogenyClasses(Controller):
                         try:
                             invs, mult = IC.simplepow_brauer_data
                         except ValueError:
+                            # Not simple
                             continue
                         if mult != 1:
                             continue
@@ -796,6 +781,9 @@ class IsogenyClasses(Controller):
                 self.save(make_simples())
 
     class StageGenerateAll(Stage):
+        """
+        Assemble simple isogeny classes into all isogeny classes, save some more data about them.
+        """
         name = 'Generate All'
         shortname = 'GenAll'
         class Task(GenericTask):
@@ -819,11 +807,18 @@ class IsogenyClasses(Controller):
                                 factors = factors[0]
                             else:
                                 factors = sum(factors, ())
-                            factors = Counter(factors).items()
+                            factors = Counter(factors).items() # Need list after py3
                             factors.sort(key=lambda ICpair: (ICpair[0].g, ICpair[0].poly))
                             yield IsogenyClass.by_decomposition(factors, db=db)
                 self.save(make_all())
+
     class StageUnknownFields(Stage):
+        """
+        Find all fields not contained within the LMFDB.
+        This stage is not directly used in the production of isogeny class data,
+        but is relevant in ensuring that the ``number_fields`` and ``galois_group``
+        columns are filled in.
+        """
         name = 'Unknown Fields'
         shortname = 'Fields'
         class Task(GenericTask):
@@ -832,14 +827,16 @@ class IsogenyClasses(Controller):
                 controller = stage.controller
                 def make_all():
                     for IC in self.enumerate(controller.load(self.input_data[0][1], db=db)):
-                        rec = FieldRecord(IC.Ppoly, db=db)
+                        rec = FieldRecord(IC, db=db)
                         if rec.label is None:
                             yield rec
                 self.save(make_all(), cls=FieldRecord)
-                #else:
-                #    outfile = stage.output[0][0].format(**self.kwds)
-                #    self._finish(outfile, self.t0)
+
     class StageCollateFields(Stage):
+        """
+        Combine the results of StageUnknownFields for different g,q into one file (removing duplicates)
+        As with that stage, this one is not used directly in the production of isogeny class data.
+        """
         name = 'Collate Fields'
         shortname = 'CollFld'
         @lazy_attribute
@@ -941,6 +938,10 @@ class IsogenyClasses(Controller):
                         # record some geometric data
                         base_class.geometric_center_dim = extension_class.center_dim
                         base_class.is_geometrically_simple = extension_class.is_simple
+                        base_class.max_geom_divalg_dim = max(simple_factor.divalg_dim for simple_factor, mult in extension_class.decomposition)
+                        base_class.has_geom_ss_factor = any(simple_factor.center_dim == 1 for simple_factor, mult in extension_class.decomposition)
+                        base_class.geometric_number_fields = extension_class.number_fields
+                        base_class.geometric_galois_groups = extension_class.galois_groups
                         for m in range(1, 6):
                             setattr(base_class, 'geom_dim%s_factors'%m, sum(mult for simple_factor, mult in extension_class.decomposition if simple_factor.g == m))
                             setattr(base_class, 'geom_dim%s_distinct'%m, len([mult for simple_factor, mult in extension_class.decomposition if simple_factor.g == m]))
@@ -1008,6 +1009,7 @@ class IsogenyClasses(Controller):
                     else:
                         self.log("Saving bc isogeny classes r=%s; %s total, memory %s" % (r, len(in_db[r]), process.memory_info()[0]))
                         controller.save(filename, in_db[r].values(), attributes, self.t0)
+
     class StageFixBasechange(Stage):
         name = 'FixBasechange'
         shortname = 'FixBC'
@@ -1048,13 +1050,13 @@ class IsogenyClasses(Controller):
 
             def run(self, db=None):
                 # Need to fix the following issues:
-                #  - correct geometric_extension_degree in a small list of cases, add the corresponding records to endalg_factors and endalg_data, fix geometric_center_dim and is_geometrically_simple and twists
-                #  - set geom_distinct%d and geom_factors%d and is_geometrically_simple when not present using endalg_factors
-                #  - add has_geom_ss_factor using endalg_factors and endalg_data
-                #  - add geometric_number_fields, geometric_galois_groups using endalg_data
-                #  - add max_twist_degree from twists
-                #  - add max_geom_divalg_dim
-                #  - change presentation of places to the polredabs polynomial
+                # +- correct geometric_extension_degree in a small list of cases, add the corresponding records to endalg_factors and endalg_data, fix geometric_center_dim and is_geometrically_simple and twists
+                # +- set geom_distinct%d and geom_factors%d and is_geometrically_simple when not present using endalg_factors
+                # +- add has_geom_ss_factor using endalg_factors and endalg_data
+                # +- add geometric_number_fields, geometric_galois_groups using endalg_data
+                # +- add max_twist_degree from twists
+                # +- add max_geom_divalg_dim
+                # +- change presentation of places to the polredabs polynomial
                 # and backport to StageBasechange
                 process = psutil.Process(os.getpid())
                 stage = self.stage
@@ -1200,41 +1202,14 @@ class IsogenyClasses(Controller):
                     else:
                         self.log("Saving bc isogeny classes r=%s; %s total, memory %s" % (r, len(in_db[r]), process.memory_info()[0]))
                         controller.save(filename, in_db[r].values(), attributes, self.t0)
-    class StageFixEndalgData(Stage):
-        name = 'FixEndalgData'
-        shortname = 'FixEndalg'
-        @lazy_attribute
-        def tasks(self):
-            return [self.Task(g, q, self) for g, q in self.controller.gq if q.is_prime()]
-        class Task(GenericTask):
-            def __init__(self, g, p, stage):
-                self.g, self.p, self.stage = g, p, stage
-                self.kwds = {'g':g, 'p':p}
-                self.logheader = stage.controller.logheader.format(g=g, q=p, name=stage.shortname)
-                self.qs = [q for (g, q) in stage.controller.gq if g == self.g and q%p == 0]
-                self.rs = [q.is_prime_power(get_data=True)[1] for q in self.qs]
-            def _logdata(self):
-                return '_%s_%s' % (self.g, self.p)
-            @lazy_attribute
-            def input_data(self):
-                return [(None, self.stage.input[0].format(g=self.g, p=self.p))] + [(r, self.stage.input[1].format(g=self.g, q=q)) for q, r in zip(self.qs, self.rs)]
-            def run(self, db=None):
-                stage = self.stage
-                controller = stage.controller
-                g, p = self.g, self.p
-                sources = [(r, controller.load(filename, db=db)) for (r, filename) in self.input_data[1:]]
-                seen = set()
-                def make_all():
-                    for r, source in sources:
-                        for IC in source:
-                            if IC.label in seen:
-                                continue
-                            if r is not None and not IC.is_simple:
-                                continue
-                            seen.add(IC.label)
-                            yield IC
-                self.save(make_all())
+
     class StageCombine(Stage):
+        """
+        This Stage is used to combine data from multiple sources into a single file per g,q.
+        Sources include computations from outside this framework (e.g. Stefano's computations of
+        the number of isomorphism classes in each isogeny class, or Drew's computations of Jacobians)
+        as well as the base change data.
+        """
         name = 'Combine'
         shortname = 'Combo'
         class Task(GenericTask):
@@ -1257,7 +1232,19 @@ class IsogenyClasses(Controller):
                         ICs = data[key]
                         yield IsogenyClass.combine(ICs, db=db)
                 self.save(make_all())
+
     class StageCollate(Stage):
+        """
+        This Stage is used to combine the output for different g,q into one file
+        for uploading into the database.
+
+        If the resulting files look okay, you can upload them to the lmfdb with the following commands
+
+            sage: from lmfdb import db
+            sage: db.av_fq_isog.reload('/home/roed/avfq/av_fq_isog.txt', sep=':')
+            sage: db.av_fq_endalg_data.reload('/home/roed/avfq/av_fq_endalg_data.txt', sep=':')
+            sage: db.av_fq_endalg_factors.reload('/home/roed/avfq/av_fq_endalg_factors.txt', sep=':')
+        """
         name = 'Collate'
         shortname = 'Coll'
         @lazy_attribute
@@ -1283,32 +1270,29 @@ class IsogenyClasses(Controller):
             def run(self, db=None):
                 stage = self.stage
                 controller = stage.controller
-                # We need to rewrite some headers (a temporary fix)
-                #headers = ['text:smallint:integer:integer[]:text:text[]:smallint:double precision[]:smallint:text[]:text[]:smallint:numeric[]:text:numeric:numeric[]:text:integer:smallint:smallint:smallint:smallint:text[]:boolean:jsonb:boolean:text[]:smallint[]:text[]:smallint:smallint:smallint:smallint:smallint:smallint:smallint:smallint:smallint:smallint:integer[]:integer:boolean:boolean:numeric:numeric[]:numeric:numeric[]:numeric\n', None, None]
-                headers = [None, None, None]
-                #replacers = [[], [('-','')], []]
-                replacers = [[], [], []]
                 # We don't use load and save since we're just copying lines to the output
-                for (outfile, _), infiles, H, R in zip(stage.output, self.input_data, headers, replacers):
+                for (outfile, _), infiles in zip(stage.output, self.input_data):
                     header_written = False
                     with open(outfile, 'w') as Fout:
                         for (g,q), filename in infiles:
-                            print filename # should go to logfile once we set up logging appropriately
+                            self.log(filename)
                             with open(filename) as F:
                                 for i, line in enumerate(F):
                                     if i > 2:
-                                        for Ri, Ro in R:
-                                            line = line.replace(Ri, Ro)
                                         Fout.write(line)
                                     elif not header_written:
-                                        if i == 1 and H is not None:
-                                            # This is a temporary fix so that we don't need to change all of the headers
-                                            Fout.write(H)
-                                        else:
-                                            Fout.write(line)
-                                            if i == 2:
-                                                header_written = True
+                                        Fout.write(line)
+                                        if i == 2:
+                                            header_written = True
+
     class StageRecompute(Stage):
+        """
+        This Stage is used to recompute a set of columns.  To use it, edit the config file
+        to add the desired columns to the "fix" line.  It will only work with columns
+        that can be intrinsically recomputed (as opposed to columns like "twists", which use
+        other isogeny classes.
+        It is not used in the normal course of computations.
+        """
         name = 'Recompute'
         shortname = 'Recomp'
         def __init__(self, controller, input, output):
@@ -1327,230 +1311,41 @@ class IsogenyClasses(Controller):
                                 delattr(IC, fix)
                         yield IC
                 self.save(make_all())
-    class StageReorderDecomposition(Stage):
-        name = 'ReorderDecomposition'
-        shortname = 'Reorder'
-        class Task(GenericTask):
-            def run(self, db=None):
-                stage = self.stage
-                controller = stage.controller
-                sources = [controller.load(filename, db=db) for _, filename in self.input_data]
-                def make_all():
-                    for IC in sources[0]:
-                        if not IC.is_simple:
-                            # sort simple_distinct, simple_multiplicities, number_fields and galois_groups
-                            decomp_data = zip(IC.decomposition, IC.simple_distinct, IC.simple_multiplicities, IC.number_fields, IC.galois_groups)
-                            decomp_data.sort(key=lambda data: (data[0][0].g, data[0][0].poly))
-                            IC.decomposition, IC.simple_distinct, IC.simple_multiplicities, IC.number_fields, IC.galois_groups = map(list, zip(*decomp_data))
-                        yield IC
-                def make_bc():
-                    for IC in sources[1]:
-                        if not IC.is_primitive:
-                            models = [IsogenyClass(label=model) for model in IC.primitive_models]
-                            models.sort(key=lambda model: (model.q, model.poly))
-                            IC.primitive_models = [model.label for model in models]
-                        yield IC
-                self.save(make_all(), make_bc())
-    class StageFixTwists(Stage):
-        name = 'Fix Twists'
-        shortname = 'FixTwist'
-        class Task(GenericTask):
-            def run(self, db=None):
-                stage = self.stage
-                controller = stage.controller
-                source = controller.load(self.input_data[0][1], db=db)
-                def make_all():
-                    for IC in source:
-                        twists = IC.twists
-                        TD = defaultdict(dict)
-                        for JC, BC, n in twists:
-                            for old_deg in list(TD[JC]):
-                                if old_deg % n == 0:
-                                    del TD[JC][old_deg]
-                            for old_deg in TD[JC]:
-                                if n % old_deg == 0:
-                                    break
-                            else:
-                                TD[JC][n] = BC
-                        twists = []
-                        for JC, D in TD.items():
-                            for deg, BC in D.items():
-                                twists.append([JC, BC, deg])
-                        twists.sort(key = lambda x: (x[2], map(signed_class_to_int, x[0].split('.')[2].split('_'))))
-                        IC.twists = twists
-                        yield IC
-                self.save(make_all())
-    class StageFixCols(Stage):
-        name = 'Fix Columns'
-        shortname = 'FixCols'
-        class Task(GenericTask):
-            @lazy_attribute
-            def input_data(self):
-                gs = range(1, self.g+1)
-                q = self.q
-                return [(g, self.stage.input[0].format(g=g, q=q)) for g in gs]
-            def run(self, db=None):
-                stage = self.stage
-                controller = stage.controller
-                mids = {g: list(controller.load(filename, db=db)) for (g, filename) in self.input_data}
-                lookup = {IC.label: IC for ICs in mids.values() for IC in ICs}
-                final = mids[self.g]
-                for IC in final:
-                    IC.decomposition = [(lookup[label], mult) for label, mult in IC.decomp]
-                self.save(final)
+
     class StageDBLoad(Stage):
+        """
+        This Stage is used to load data from the database into files of the appropriate format.
+        It is not used in the normal course of computations.
+        """
         name = 'DBLoad'
         shortname = 'DBLoad'
         class Task(GenericTask):
             def run(self, db=None):
                 outfile, _ = self.stage.output[0]
                 outfile = outfile.format(g=self.g, q=self.q)
-                cols = [(attr.__name__, attr.pg_type) for attr in IsogenyClass.__dict__.values() if isinstance(attr, PGOld)]
+                cols = [(attr.__name__, attr.pg_type) for attr in IsogenyClass.__dict__.values() if isinstance(attr, PGType)]
                 col_names, col_types = zip(*cols)
-                selecter = SQL("SELECT {0} FROM av_fqisog WHERE g={1} AND q = {2}").format(SQL(", ").join(map(Identifier, col_names)), Literal(self.g), Literal(self.q))
+                selecter = SQL("SELECT {0} FROM av_fq_isog WHERE g={1} AND q = {2}").format(SQL(", ").join(map(Identifier, col_names)), Literal(self.g), Literal(self.q))
                 self.log('DBloaded')
                 header = "%s\n%s\n\n" % (":".join(col_names), ":".join(col_types))
                 db._copy_to_select(selecter, outfile, header=header, sep=":")
                 self.stage.controller._finish(outfile, self.t0)
-    class StageGenerateMissing(Stage):
-        name = 'GenerateMissing'
-        shortname = 'GenMissing'
-        class Task(GenericTask):
-            @lazy_attribute
-            def input_data(self):
-                g, q = self.g, self.q
-                p, r = q.is_prime_power(get_data=True)
-                if r % 2 == 1: # Only missing data when q is not a square
-                    gs = range(1, g+1)
-                else:
-                    gs = [g]
-                return [(gg, self.stage.input[0].format(g=gg, q=q)) for gg in gs]
-            def run(self, db=None):
-                self.log("Starting")
-                stage = self.stage
-                controller = stage.controller
-                sources = {g: list(controller.load(filename, db=db)) for (g, filename) in self.input_data}
-                lookup = {IC.label: IC for g, ICs in sources.items() for IC in ICs}
-                q = self.q
-                SC = IsogenyClass(poly=[1,0,-2*q,0,q**2], db=db)
-                self.log("Sources loaded")
-                def make_all():
-                    if self.g % 2 == 0:
-                        yield IsogenyClass.by_decomposition([(SC, self.g // 2)], db=db)
-                    for g, olddata in sources.items():
-                        if (self.g - g) % 2 != 0:
-                            # Missing simple isogeny class is in g=2
-                            continue
-                        self.log("Starting g=%s"%g)
-                        for IC in self.enumerate(olddata):
-                            IC.set_from_old() # Set the new-style attributes using the ones from the database
-                            if g == self.g:
-                                yield IC
-                            else:
-                                factors = [(lookup[label], mult) for label, mult in IC.decomp] + [(SC, (self.g - g)//2)]
-                                yield IsogenyClass.by_decomposition(factors, db=db)
-                self.save(make_all())
 
-    class StageBasechangeOld(Stage):
-        name = 'BasechangeOld'
-        shortname = 'BCO'
-        @lazy_attribute
-        def tasks(self):
-            return [self.Task(g, q, self) for g, q in self.controller.gq if q.is_prime()]
-        class Task(GenericTask):
-            def __init__(self, g, p, stage):
-                self.g, self.p, self.stage = g, p, stage
-                self.logheader = stage.controller.logheader.format(g=g, q=p, name=stage.shortname)
-                self.qs = [q for (g, q) in stage.controller.gq if g == self.g and q%p == 0]
-                self.rs = [q.is_prime_power(get_data=True)[1] for q in self.qs]
-            def _logdata(self):
-                return '_%s_%s' % (self.g, self.p)
-
-            @lazy_attribute
-            def input_data(self):
-                return [(r, self.stage.input[0].format(g=self.g, q=q)) for q, r in zip(self.qs, self.rs)]
-            @lazy_attribute
-            def output_data(self):
-                stage = self.stage
-                filename, attributes = stage.output[0]
-                return [(r, filename.format(g=self.g, q=self.p^r), attributes) for r in self.rs]
-
-            @lazy_attribute
-            def donefiles(self):
-                return [filename[:-4] + '.done' for (r, filename, attributes) in self.output_data]
-
-            def run(self, db=None):
-                g, p = self.g, self.p
-                self.log("Starting g=%s p=%s"%(g,p))
-                stage = self.stage
-                controller = stage.controller
-                in_db = {r: {IC.label: IC for IC in controller.load(filename, db=db)} for (r, filename) in self.input_data}
-                base_changes = defaultdict(lambda: defaultdict(list))
-                for ICs in in_db.values():
-                    for IC in ICs.values():
-                        IC.primitive_models = []
-                self.log("Loading complete")
-                for r, ICs in in_db.items():
-                    q = p**r
-                    self.log("Starting q=%s"%(q))
-                    for IC in self.enumerate(ICs.values()):
-                        if IC.primitive_models: # already a base change
-                            continue
-                        for s in self.rs:
-                            # Note that this s differs from the s in BaseChange by a factor of r
-                            if s > r and s%r == 0:
-                                BC = IsogenyClass(Lpoly=base_change(IC.Lpoly, s//r, g=g, q=q), db=db)
-                                # Get the version of BC with everything computed
-                                BC = in_db[s][BC.label]
-                                BC.primitive_models.append(IC.label)
-                # Check to see that we agree with the old version when present
-                self.log("Checking consistency....")
-                for ICs in in_db.values():
-                    for IC in ICs.values():
-                        # Sorting?
-                        if IC.prim_models is not None and any(PM not in IC.primitive_models for PM in IC.prim_models):
-                            print "Prim models mismatch (%s): %s vs %s" % (IC.label, IC.prim_models, IC.primitive_models)
-                            #raise RuntimeError((IC.prim_models, IC.primitive_models))
-                        IC.prim_models = IC.primitive_models
-                        IC.is_prim = not IC.primitive_models
-                self.log("Saving....")
-                for r, filename, attributes in self.output_data:
-                    controller.save(filename, in_db[r].values(), attributes, self.t0)
-    class StageCheck(Stage):
-        name = 'Check'
-        shortname = 'Check'
-        class Task(GenericTask):
-            @lazy_attribute
-            def input_data(self):
-                return [(None, self.stage.input[0].format(g=self.g, q=self.q))]
-            def run(self, db=None):
-                stage = self.stage
-                controller = stage.controller
-                source = controller.load(self.input_data[0][1], db=db)
-                db_data = {rec['label']: rec for rec in db.av_fqisog.search({'g':self.g, 'q': self.q}, sort=[])}
-                reports = []
-                for IC in source:
-                    report = IC.validation_report(db_data.get(IC.label))
-                    if report:
-                        reports.append(report)
-                outfile, attributes = self.stage.output[0]
-                outfile = outfile.format(g=self.g, q=self.q)
-                if reports:
-                    controller.save(outfile, reports, attributes, self.t0, cls=ValidationReport)
-                else:
-                    controller._finish(outfile, self.t0)
     class StagePolyOut(Stage):
+        """
+        This Stage is used to write Weil polynomials to a file.
+        It is not used in the normal course of computations.
+        """
         name = 'PolyOut'
         shortname = 'PolyOut'
         class Task(GenericTask):
             def run(self, db=None):
                 stage = self.stage
                 controller = stage.controller
-                if (self.g == 1 and self.q > 499) or (self.g == 2 and self.q > 211) or (self.g == 3 and self.q > 13):
-                    infile = self.input_data[0][1]
-                    self.save(controller.load(infile))
+                infile = self.input_data[0][1]
+                self.save(controller.load(infile))
 
-    def load(self, filename, start=None, stop=None, cls=None, old=False, db=None, allow_empty=False):
+    def load(self, filename, start=None, stop=None, cls=None, db=None, allow_empty=False):
         """
         Iterates over all of the isogeny classes stored in a file.
         The data contained in the file is specified by header lines: the first giving the
@@ -1567,19 +1362,14 @@ class IsogenyClasses(Controller):
             file because of the header.
         - ``stop`` -- if not None``, the first line not to read, indexed as for ``start``
         - ``cls`` -- the PGSaver class to load data into
-        - ``old`` -- if True, uses 'old_'+attr for attributes in the header if possible
         """
         if cls is None:
             cls = self.default_cls
-        def fix_attr(attr):
-            if old and hasattr(cls, 'old_' + attr):
-                attr = 'old_' + attr
-            return attr
         if ope(filename):
             with open(filename) as F:
                 for i, line in enumerate(F):
                     if i == 0:
-                        header = map(fix_attr, line.strip().split(':'))
+                        header = line.strip().split(':')
                     elif i >= 3 and (start is None or i-3 >= start) and (stop is None or i-3 < start):
                         yield cls.load(line.strip(), header, db=db)
         elif not allow_empty:
@@ -1615,59 +1405,6 @@ class IsogenyClasses(Controller):
             for isog in isogeny_classes:
                 F.write(isog.save(attributes) + '\n')
         self._finish(filename, t0)
-
-    def combine_all(self):
-        # Manual sorting to fix the critical bug; should be replaced by a stage
-        old_header = None
-        type_line = None
-        id_cntr = 1
-        with open(opj(self.basedir, "all.txt"), 'w') as Fout:
-            for g, q in sorted(self.gq):
-                filename = opj(self.basedir, 'complete/weil_actual_g{g}_q{q}.txt'.format(g=g, q=q))
-                with open(filename) as Fin:
-                    lines = []
-                    for i, line in enumerate(Fin):
-                        if i == 0:
-                            if old_header is None:
-                                old_header = line
-                                pieces = old_header.strip().split(':')
-                                pieces = [piece[4:] if piece.startswith('old_') else piece for piece in pieces]
-                                new_header = 'id:' + ':'.join(pieces) + '\n'
-                                Fout.write(new_header)
-                            elif old_header != line:
-                                raise ValueError
-                        elif i == 1:
-                            if type_line is None:
-                                type_line = line
-                                Fout.write('bigint:'+line+'\n')
-                            elif type_line != line:
-                                raise ValueError
-                        elif i == 2:
-                            if line != '\n':
-                                raise ValueError
-                        else:
-                            poly = map(int, line.split(':',4)[3][1:-1].split(','))
-                            lines.append((poly, line))
-                    for poly, line in sorted(lines):
-                        Fout.write('%s:'%id_cntr + line)
-                        id_cntr += 1
-
-    def fix_parens(self):
-        with open(opj(self.basedir, "all.txt")) as Fold:
-            with open(opj(self.basedir, "fixed.txt"), 'w') as Fnew:
-                for line in Fold:
-                    Fnew.write(line.replace("(","[").replace(")","]"))
-
-    def fix_ratlist(self):
-        quoter = re.compile(r"(-?\d+/\d+|-?\d+)")
-        with open(opj(self.basedir, "all.txt")) as Fold:
-            with open(opj(self.basedir, "fixed.txt"), 'w') as Fnew:
-                for i, line in enumerate(Fold):
-                    if i > 2:
-                        pieces = line.split(':')
-                        pieces[23] = quoter.sub(r'"\1"', pieces[23])
-                        line = ':'.join(pieces)
-                    Fnew.write(line)
 
 class PGSaver(object):
     @classmethod
@@ -1777,7 +1514,7 @@ class IsogenyClass(PGSaver):
     def Lpoly(self):
         return ZZ['x'](self.poly)
 
-    @pg_text_old # FIXME once no longer porting
+    @pg_text
     def label(self):
         if 'short_curve_counts' in self.__dict__:
             # We allow specifying q and short_curve_counts
@@ -1792,14 +1529,14 @@ class IsogenyClass(PGSaver):
     def Ppoly(self):
         return self.Lpoly.reverse()
 
-    @pg_smallint_old # FIXME once no longer porting
+    @pg_smallint
     def g(self):
         d = self.Lpoly.degree()
         if d % 2 == 1:
             raise ValueError("Must have even degree")
         return d // 2
 
-    @pg_integer_old # FIXME once no longer porting
+    @pg_integer
     def q(self):
         return self.Ppoly[0].nth_root(self.g)
 
@@ -1829,7 +1566,7 @@ class IsogenyClass(PGSaver):
             print self.label
             raise
 
-    @pg_smallint_old # FIXME once no longer porting
+    @pg_smallint
     def p_rank(self):
         return self.slopes.count(0)
 
@@ -1959,7 +1696,7 @@ class IsogenyClass(PGSaver):
     def abvar_count(self):
         return self.abvar_counts[0]
 
-    @pg_text_old # FIXME once no longer porting
+    @pg_text
     def poly_str(self):
         return ' '.join(map(str, self.poly)) + ' '
 
@@ -2101,17 +1838,25 @@ class IsogenyClass(PGSaver):
     def is_simple(self):
         return len(self.decomposition) == 1 and self.decomposition[0][1] == 1
 
+    @lazy_attribute
+    def geometric_basechange(self):
+        g, q, s = self.g, self.q, self.geometric_extension_degree
+        return IsogenyClass(Lpoly=base_change(self.Lpoly, s, g=g, q=q), db=self.db)
+
     @pg_boolean
     def is_geometrically_simple(self):
-        # set by base change
-        g, q, s = self.g, self.q, self.geometric_extension_degree
-        return IsogenyClass(Lpoly=base_change(self.Lpoly, s, g=g, q=q), db=self.db).is_simple
+        # set by base change stage
+        return self.geometric_basechange.is_simple
 
-    #@pg_boolean
-    #def has_geom_ss_factor(self):
-    #    # set by base change
-    #    g, q, s = self.g, self.q, self.geometric_extension_degree
-    #
+    @pg_boolean
+    def has_geom_ss_factor(self):
+        # set by base change stage
+        return any(simple_factor.center_dim == 1 for simple_factor, mult in self.geometric_basechange.decomposition)
+
+    @pg_smallint
+    def max_geom_divalg_dim(self):
+        # set by base change stage
+        return max(simple_factor.divalg_dim for simple_factor, mult in self.geometric_basechange.decomposition)
 
     @pg_text_list
     def simple_distinct(self):
@@ -2163,7 +1908,7 @@ class IsogenyClass(PGSaver):
         return [R(poly) for poly in self.polred_coeffs]
 
     # We can't use pg_numeric_list since polynomials may be of different degrees
-    @pg_jsonb
+    @pg_jsonb(internal=True)
     def polred_coeffs(self):
         return [map(ZZ, pari(poly).polredbest().polredabs()) for poly, e in self.Ppoly_factors]
 
@@ -2209,16 +1954,26 @@ class IsogenyClass(PGSaver):
 
     @pg_smallint
     def geometric_center_dim(self):
-        g, q, s = self.g, self.q, self.geometric_extension_degree
-        return IsogenyClass(Lpoly=base_change(self.Lpoly, s, g=g, q=q), db=self.db).center_dim
+        # Set by base change stage
+        return self.geometric_basechange.center_dim
 
     @pg_text_list
     def number_fields(self):
         return self._nf_data[0]
 
     @pg_text_list
+    def geometric_number_fields(self):
+        # Set by base change stage
+        return self.geometric_basechange.number_fields
+
+    @pg_text_list
     def galois_groups(self):
         return self._nf_data[1]
+
+    @pg_text_list
+    def geometric_galois_groups(self):
+        # Set by base change stage
+        return self.geometric_basechange.galois_groups
 
     @staticmethod
     def _is_significant(rel, sprec):
@@ -2292,8 +2047,7 @@ class IsogenyClass(PGSaver):
     @pg_text_list
     def primitive_models(self):
         # Will be set by the base change stage code
-        print self.label
-        raise RuntimeError
+        raise RuntimeError(self.label)
 
     @pg_boolean
     def is_primitive(self):
@@ -2302,10 +2056,13 @@ class IsogenyClass(PGSaver):
     @pg_jsonb
     def twists(self):
         # Will be set by the base change stage code
-        raise RuntimeError
+        raise RuntimeError(self.label)
     @pg_integer
     def twist_count(self):
         return len(self.twists)
+    @pg_smallint
+    def max_twist_degree(self):
+        return max(deg for JClabel, BClabel, deg in IC.twists)
 
     # The following columns are used in av_fq_endalg_data as synonyms
 
@@ -2438,7 +2195,7 @@ class IsogenyClass(PGSaver):
                 Nsquared = ZZ((F-V).norm())
                 N = Nsquared.isqrt()
                 if Nsquared != N^2:
-                    raise RuntimeError
+                    raise RuntimeError(self.label)
                 qq = q if q > 2 else 4
                 return 1r if (N - coeffs[g]) % qq == 0 else -1r
         elif all(IC.has_principal_polarization for IC, mult in self.decomposition):
@@ -2810,181 +2567,6 @@ class IsogenyClass(PGSaver):
         # The following will raise a ValueError if Honda-Tate isn't satsified
         D = self.decomposition
 
-    def validation_report(self, db_data):
-        """
-        Compares the data in this isogeny class with a record from the av_fqisog table of the LMFDB.
-
-        Returns a ValidationReport object with the differences.  If no differences, then the
-        returned object will evaluate to False in a boolean context.
-        """
-        diff_dict = {}
-        for dbname, attr in self.__class__.__dict__.items():
-            if dbname in ['C_cnts_str', 'pt_cnt']:
-                # checked by C_cnts
-                continue
-            if not isinstance(attr, PGOld):
-                continue
-            if dbname.startswith('old_'):
-                dbname = dbname[4:]
-            icname, switch = attr.new_name, attr.switch
-            if icname and switch: # Some old columns don't have direct new analogues
-                dbval = switch(db_data.get(dbname), self.db)
-                icval = getattr(self, icname)
-                if icname == 'slopes':
-                    dbval = [QQ(str(x).translate(None, letters)) for x in dbval]
-                if dbname in ['simple_factors', 'simple_distinct']:
-                    dbval = sorted(dbval)
-                    icval = sorted(icval)
-                if icname == 'angles':
-                    max_diff = 0
-                    for a in icval:
-                        min_diff = 1
-                        for b in dbval:
-                            if abs(a-b) < min_diff:
-                                min_diff = abs(a-b)
-                        if min_diff > max_diff:
-                            max_diff = min_diff
-                    if max_diff > 1e-14:
-                        diff_dict[dbname, icname] = (dbval, icval)
-                elif dbname == 'poly_str':
-                    if not icval in [dbval, dbval + ' ']:
-                        diff_dict[dbname, icname] = (dbval, icval)
-                elif dbname == 'C_cnts':
-                    if icval != dbval:
-                        moddedic = [x for x in icval if x != 0]
-                        moddeddb = dbval[:len(moddedic)]
-                        if moddedic != moddeddb:
-                            diff_dict[dbname, icname] = (dbval, icval)
-                elif dbname in ['is_pp', 'is_jac']:
-                    if dbval != 0 and dbval != icval:
-                        # See if it's been fixed
-                        #if not (dbval == -1 and icval == 0 and self._nojac_pointcounts()):
-                        diff_dict[dbname, icname] = (dbval, icval)
-                elif dbval != icval:
-                    diff_dict[dbname, icname] = (dbval, icval)
-        return ValidationReport(self.label, diff_dict)
-
-    # The following methods and attributes support access to the old schema
-
-    def set_from_old(self, check=False):
-        # Have to set the values first so that computations work
-        if check:
-            self.set_from_old(check=False)
-        for aname, attr in self.__class__.__dict__.items():
-            if not isinstance(attr, PGOld):
-                continue
-            newname, switch = attr.new_name, attr.switch
-            if newname and switch: # Some old columns don't have direct new analogues
-                oldval = getattr(self, aname)
-                newval = switch(oldval, self.db)
-                if check:
-                    compval = getattr(self, newname)
-                    if newval != compval:
-                        print "%s (%s -> %s): %s vs %s"%(self.label, aname, newname, newval, compval)
-                else:
-                    setattr(self, newname, newval)
-
-    @pg_jsonb_old
-    def old_poly(self):
-        return self.poly
-
-    @pg_jsonb_old
-    def old_angles(self):
-        return self.angles
-
-    @pg_smallint_old(new_name='angle_rank')
-    def ang_rank(self):
-        return self.angle_rank
-
-    @pg_rational_mults_old(new_name='slopes')
-    def slps(self):
-        return self.slopes
-
-    @pg_jsonb_old(new_name='abvar_counts')
-    def A_cnts(self):
-        return self.abvar_counts
-
-    @pg_text_old(new_name='abvar_counts_str')
-    def A_cnts_str(self):
-        return self.abvar_counts_str
-
-    @pg_jsonb_old(new_name='curve_counts')
-    def C_cnts(self):
-        return self.curve_counts
-
-    @pg_text_old(new_name='curve_counts_str')
-    def C_cnts_str(self):
-        return self.curve_counts_str
-
-    @pg_integer_old(new_name='curve_count')
-    def pt_cnt(self):
-        return self.curve_count
-
-    @pg_smallint_old(new_name='has_jacobian')
-    def is_jac(self):
-        return self.has_jacobian
-
-    @pg_smallint_old(new_name='has_principal_polarization')
-    def is_pp(self):
-        return self.has_principal_polarization
-
-    @pg_jsonb_old(new_name='decomposition', switch=lambda x,db:[(IsogenyClass(label=label, db=db), e) for label, e in x])
-    def decomp(self):
-        return [[IC.label, e] for IC, e in self.decomposition]
-
-    @pg_boolean_old(new_name='is_simple')
-    def is_simp(self):
-        return self.is_simple
-
-    @pg_jsonb_old
-    def old_simple_factors(self):
-        return self.simple_factors
-
-    @pg_jsonb_old
-    def old_simple_distinct(self):
-        return self.simple_distinct
-
-    @pg_text_old(new_name='brauer_invariants', switch=False)#lambda x: x.split())
-    def brauer_invs(self):
-        return " ".join(" ".join(map(str, IC.brauer_invariants)) for IC, mult in self.decomposition)
-
-    @pg_rational_list_old(switch=False)
-    def old_places(self):
-        return [IC.places for IC, mult in self.decomposition]
-
-    @pg_jsonb_old(new_name='primitive_models', switch=False)
-    def prim_models(self):
-        # These are set in BasechangeOld.  Since we need to store these in the previous
-        # stage, we return None by default.
-        return None
-
-    @pg_boolean_old(new_name='is_primitive', switch=False)
-    def is_prim(self):
-        # These are set in BasechangeOld.  Since we need to store these in the previous
-        # stage, we return None by default.
-        return None
-
-    @pg_text_old(new_name='number_fields', switch=False)
-    def nf(self):
-        if len(self.decomposition) > 1:
-            return None
-        else:
-            return self.number_fields[0]
-
-    @pg_integer_old(new_name='galois_groups', switch=False)
-    def galois_t(self):
-        if len(self.decomposition) > 1:
-            return None
-        else:
-            return int(self.galois_groups[0].split('T')[1])
-
-    @pg_smallint_old(new_name=False)
-    def galois_n(self):
-        if len(self.decomposition) > 1:
-            return None
-        else:
-            return int(self.galois_groups[0].split('T')[0])
-
 for d in range(1,6):
     def dim_factors(self, d=d): # Need to bind d before it changes
         # Have to make a local copy of d since d is changing in the loop
@@ -2993,18 +2575,19 @@ for d in range(1,6):
     def dim_distinct(self, d=d):
         return len([simp_label for simp_label in self.simple_distinct if simp_label.split('.')[0] == str(d)])
     def geom_dim_factors(self, d=d):
-        raise RuntimeError
+        # Set in base change stage
+        return self.geometric_basechange.dim_factors(d=d)
     def geom_dim_distinct(self, d=d):
-        raise RuntimeError
-    # FIXME once no longer porting
+        # Set in base change stage
+        return self.geometric_basechange.dim_distinct(d=d)
     dim_factors.__name__ = 'dim%d_factors'%d
     dim_distinct.__name__ = 'dim%d_distinct'%d
     geom_dim_factors.__name__ = 'geom_dim%d_factors'%d
     geom_dim_distinct.__name__ = 'geom_dim%d_distinct'%d
-    setattr(IsogenyClass, 'dim%d_factors'%d, pg_smallint_old(dim_factors))
-    setattr(IsogenyClass, 'dim%d_distinct'%d, pg_smallint_old(dim_distinct))
-    setattr(IsogenyClass, 'geom_dim%d_factors'%d, pg_smallint_old(geom_dim_factors))
-    setattr(IsogenyClass, 'geom_dim%d_distinct'%d, pg_smallint_old(geom_dim_distinct))
+    setattr(IsogenyClass, 'dim%d_factors'%d, pg_smallint(dim_factors))
+    setattr(IsogenyClass, 'dim%d_distinct'%d, pg_smallint(dim_distinct))
+    setattr(IsogenyClass, 'geom_dim%d_factors'%d, pg_smallint(geom_dim_factors))
+    setattr(IsogenyClass, 'geom_dim%d_distinct'%d, pg_smallint(geom_dim_distinct))
 
 class BaseChangeRecord(PGSaver):
     """
@@ -3029,41 +2612,18 @@ class FieldRecord(PGSaver):
     """
     This class is used to output data for adding new fields to the LMFDB
     """
-    def __init__(self, f, db=None):
-        R = f.parent()
-        f = R(pari(f).polredbest().polredabs())
+    def __init__(self, IC, db=None):
+        if not IC.is_simple:
+            raise ValueError("FieldRecord requires a simple isogeny class")
         if db is None:
             db = PostgresDatabase()
-        self.f = f
-        self.coeffs = coeffs = f.coefficients(sparse=False)
+        self.f = f = IC.polred_polynomials[0]
+        self.coeffs = coeffs = IC.polred_coeffs[0]
         self.K = NumberField(f, 'a')
         self.label = db.nf_fields.lucky({'coeffs':coeffs}, projection='label')
     @pg_jsonb
     def data(self):
         return [self.coeffs, self.K.discriminant().support()]
-class ValidationReport(PGSaver):
-    """
-    This class is used to record discrepancies between a computed isogeny class
-    and an isogeny class from the database.
-    """
-    def __init__(self, label, diff_dict):
-        self.label = label
-        self.diff_dict = diff_dict
-    def __nonzero__(self):
-        return bool(self.diff_dict)
-    __bool__ = __nonzero__
-    @pg_text
-    def label(self):
-        raise RuntimeError
-    @pg_text
-    def report(self):
-        errors = []
-        for (db_key, ic_key), (db_val, ic_val) in self.diff_dict.items():
-            errors.append("%s (DB %s) <> %s (IC %s)" % (db_val, db_key, ic_val, ic_key))
-        return "    ".join(errors)
-    def _dummy(self):
-        raise RuntimeError
-    label = pg_text(_dummy)
 
 def combine_polys():
     basedir = '/scratch/importing/avfq/polys/'
