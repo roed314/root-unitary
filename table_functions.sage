@@ -107,6 +107,8 @@ TODO: Add size to StageCombine, fix errors revealed by StageCheck
 
 from sage.databases.cremona import cremona_letter_code, class_to_int # for the make_label function
 from sage.misc.lazy_attribute import lazy_attribute
+from sage.misc.cachefunc import cached_method
+from sage.misc.mrange import cartesian_product_iterator
 from sage.all import Polynomial
 import json, os, re, sys, time
 import psutil
@@ -116,7 +118,7 @@ from collections import defaultdict, Counter
 from multiprocessing import Process
 from string import letters
 from datetime import datetime
-from itertools import combinations_with_replacement, imap, izip_longest
+from itertools import combinations, combinations_with_replacement, imap, izip_longest
 from ConfigParser import ConfigParser
 from lmfdb.backend.database import PostgresDatabase
 from psycopg2.sql import SQL, Identifier, Literal
@@ -294,26 +296,224 @@ def base_change(Lpoly, r, algorithm=None, g = None, q = None, prec=53):
     else:
         return basechange_transform(g, r)(Lpoly, q)
 
+def hom_degrees(f, g, q):
+    x = f.parent().gen()
+    tcp = tensor_charpoly(f, g)(x/q)
+    # There seems to be a difficult-to-diagnose bug in factor, which causes
+    # PariError: bug in gerepile, significant pointers lost, please report
+    # Scaling tcp so that it has integral coefficients helps but
+    # doesn't completely solve the problem.
+    tcp *= tcp.denominator()
+
+    try:
+        factors = tcp.factor()
+    except PariError:
+        print "Pari error in res(%s, %s)" % (f, g)
+        # Try to work around the bug using squarefree decomposition
+        sqfree = tcp.squarefree_decomposition()
+        factors = []
+        for fac, e in sqfree:
+            for subfac, sube in fac.factor():
+                factors.append((subfac, e*sube))
+    degrees = []
+    for factor, power in factors:
+        m = Cyclotomic().order(factor)
+        if m > 0:
+            degrees.append(m)
+    return sorted(degrees)
+
+def minimal_twists(IC1, IC2, min_degs=None, max_degs=None, BC=None):
+    """
+    INPUT:
+
+    - ``IC1``, ``IC2`` -- two IsogenyClass objects with the same g and q
+    - ``min_degs`` -- (optional) a list of degrees so that every minimal twist degree
+        is a multiple of at least one, and a divisor of their lcm.
+    - ``max_degs`` -- (optional) a list of degrees where the isogeny classes become isogenous
+        (every deg will be a divisor of at least one of these)
+    - ``BC`` -- a dictionary for caching base changes across multiple calls to this function
+
+    OUTPUT:
+
+    - A list of pairs ``(deg, bc)`` giving minimal twists (for the divisibility poset),
+      where ``deg`` is a degree (a divisor of the lcm of ``degs``) and ``bc`` is the common
+      base change to that degree.
+    """
+    q = IC1.q
+    g = IC1.g
+    assert q == IC2.q and g == IC2.g
+    if min_degs is None and max_degs is None:
+        min_degs = hom_degrees(IC1.Lpoly, IC2.Lpoly, q)
+        if not min_degs:
+            return []
+    if max_dexs is None:
+        max_degs = [lcm(min_degs)]
+    primes = sorted(set(sum([D.prime_divisors() for D in max_degs], [])))
+    if min_degs is None:
+        min_degs = primes
+    found_degs = []
+    if BC is None:
+        BC = {IC1: {1: IC1.Lpoly},
+              IC2: {1: IC2.Lpoly}}
+    def _minimal_twists(cur_level):
+        """
+        INPUT:
+
+        - ``cur_level`` -- a list of pairs ``(d, p)`` where ``BC[IC1,d]`` and ``BC[IC2,d]`` are known,
+          ``d*p`` divides at least one of ``max_degs``, and ``d*p`` is not divisible by any of ``found``
+
+        OUTPUT:
+
+        None, but adds the appropriate degrees to found_degs and recursively calls the next level.
+        """
+        if not cur_level:
+            return
+        for d, p in cur_level:
+            if d*p not in BC[IC1]:
+                BC[IC1][d*p] = base_change(BC[IC1][d], p, g=g, q=q)
+            if d*p not in BC[IC2]:
+                BC[IC2][d*p] = base_change(BC[IC2][d], p, g=g, q=q)
+            if BC[IC1][d*p] == BC[IC2][d*p]:
+                found_degs.append(d*p)
+        cur_level = sorted([d*p for d,p in cur_level])
+        next_level = []
+        next_seen = set()
+        for d in reversed(cur_level): # reversed so the base change is small
+            for p in primes:
+                dp = d*p
+                if dp in next_seen:
+                    continue
+                next_seen.add(dp)
+                if any(found.divides(dp) for found in found_degs):
+                    continue
+                if not any(dp.divides(M) for M in max_degs):
+                    continue
+                next_level.append((d, p))
+        _minimal_twists(next_level)
+    _minimal_twists([(1, d) for d in min_degs])
+    found_degs.sort()
+    return [(d, IsogenyClass(Lpoly=BC[IC1][d])) for d in found_degs]
+
+def find_twists(ICs):
+    """
+    Split up a list of isogeny classes that have similar geometric data
+    (e.g. g, q, slopes and geometric endomorphism algebra),
+    into geometric isogeny classes, giving the minimal degrees required to realize isogenies.
+
+    INPUT:
+
+    - ``ICs`` -- a list of IsogenyClass objects (all with the same g and q)
+
+    OUTPUT:
+
+    - ``twists`` -- a dictionary with keys the labels of the input isogeny classes.
+      The associated value is a list of triples ``(twist, bc, deg)``, where ``twist``
+      is another isogeny class over the same base field, ``deg`` is a minimal degree
+      over which the key and ``twist`` become isogenous (note that the same twist might become
+      isogenous for degree 2 and 3; we list minimal degrees in the divisibility poset),
+      and ``bc`` is the common base change.
+    """
+    clusters = []
+    seen = set()
+    twists = {}
+    q = ICs[0].q
+    BC = {IC: {1: IC.Lpoly} for IC in ICs}
+    for IC1 in ICs:
+        if IC1.label in seen:
+            continue
+        seen.add(IC1.label)
+        clusters.append([IC1])
+        for IC2 in ICs:
+            if IC2.label in seen:
+                continue
+            mtwists = minimal_twists(IC1, IC2, BC=BC)
+            if mtwists:
+                seen.add(IC2.label)
+                clusters[-1].append(IC2)
+                twists[IC1, IC2] = mtwists
+    # We've now broken up the input into clusters; we fill out
+    # the minimal twist degrees within each cluster
+    for C in clusters:
+        IC1 = C[0]
+        for IC2, IC3 in combinations(C[1:], 2):
+            deg2 = [d for d,bc in twists[IC1, IC2]]
+            deg3 = [d for d,bc in twists[IC1, IC3]]
+            max_degs = []
+            for a, b in cartesian_product_iterator([deg2, deg3]):
+                if not any(d.divides(a*b) for d in max_degs):
+                    max_degs.append(a*b)
+            twists[IC2, IC3] = minimal_twists(IC2, IC3, max_degs=max_degs, BC=BC)
+    # Now construct the return value
+    twist_lists = defaultdict(list)
+    for IC1, IC2 in combinations(ICs, 2):
+        twist_lists[IC1.label].extend([(IC2, base_change, d) for (d, base_change) in twists[IC1, IC2]])
+        twist_lists[IC2.label].extend([(IC1, base_change, d) for (d, base_change) in twists[IC1, IC2]])
+    for L in twist_lists.values():
+        L.sort(key = lambda x: (x[2], x[0].Ppoly))
+    return twist_lists
+
 class Cyclotomic(UniqueRepresentation):
     """
-    An object for determining which polynomials are cyclotomic, and their order if they are.
+    An object for determining which polynomials are cyclotomic, and their order if they are
     """
     # Convention: phi(m) = n
     def __init__(self):
         self.polynomials = {}
-        self.mbound = 0
-        self.nbound = 0
+        self.poly_mbound = 1
+        self.poly_nbound = 0
+        self.orders = defaultdict(list)
+        self.order_mbound = 1
+        self.order_nbound = 0
+
     def order(self, f):
         """
-        If f is a cyclotomic polynomial Phi_m, returns m.
-        Otherwise, returns 0.
+        If f is a cyclotomic polynomial Phi_m, return m;
+        otherwise, return 0
         """
-        if f.degree() >= self.nbound:
-            self.compute(f.degree())
+        if f.degree() >= self.poly_nbound:
+            self.compute(f.degree(), poly=True)
         return self.polynomials.get(f, 0)
+
+    def inverse_phi(self, n):
+        """
+        Return the list of `m` so that `Phi(m) = n`
+        """
+        if n >= self.order_nbound:
+            self.compute(n, poly=False)
+        return self.orders[n]
+
+    @staticmethod
+    def _canonicalize_elem_divisors(L):
+        """
+        Return the tuple of integers so that each divides the next and
+        they yield the same abelian group as ``L``
+        """
+        ed = diagonal_matrix(ZZ, L).elementary_divisors()
+        return tuple(d for d in ed if d != 1)
+
+    @classmethod
+    def _Um_structure(cls, m):
+        v2, u2 = ZZ(m).val_unit(2)
+        if v2 < 2:
+            L = []
+        elif v2 == 2:
+            L = [2]
+        else:
+            L = [2,2^(v2-2)]
+        L.extend([(p-1)*p^(e-1) for p,e in factor(u2)])
+        return cls._canonicalize_elem_divisors(L)
+
+    def inverse_structure(self, elem_divisors):
+        """
+        Return the list of `m` so that `(Z/m)^x` has the given abelian invariants
+        """
+        n = prod(elem_divisors)
+        elem_divisors = self._canonicalize_elem_divisors(elem_divisors)
+        return [m for m in self.inverse_phi(n) if self._Um_structure(m) == elem_divisors]
+
     def get_mbound(self, nbound):
         """
-        Returns an integer `mbound` so that if `n <= nbound` and `n = Phi(m)` then `m < mbound`.
+        Return an integer `mbound` so that if `n <= nbound` and `n = Phi(m)` then `m < mbound`
         """
         # https://math.stackexchange.com/questions/265397/inversion-of-the-euler-totient-function
         steps = 0
@@ -321,16 +521,47 @@ class Cyclotomic(UniqueRepresentation):
         while n != 1:
             n = euler_phi(n)
             steps += 1
-        return 2 * 3^steps
-    def compute(self, nbound):
+        return 2 * 3^steps + 1
+
+    def compute(self, nbound, poly):
         """
         Adds cyclotomic polynomials to the cache, including all of degree less than `nbound`.
         """
         mbound = self.get_mbound(nbound)
-        for m in range(self.mbound+1, mbound+1):
-            self.polynomials[cyclotomic_polynomial(m)] = m
-        self.nbound = nbound
-        self.mbound = mbound
+        if poly:
+            for m in range(self.poly_mbound, mbound):
+                f = cyclotomic_polynomial(m)
+                self.polynomials[f] = m
+                if m >= self.order_mbound:
+                    self.orders[f.degree()].append(m)
+            self.poly_nbound = max(nbound, self.poly_nbound)
+            self.poly_mbound = max(mbound, self.poly_mbound)
+        else:
+            for m in range(self.order_mbound, mbound):
+                self.orders[euler_phi(m)].append(m)
+        self.order_nbound = max(nbound, self.order_nbound)
+        self.order_mbound = max(mbound, self.order_mbound)
+
+    @cached_method
+    def twist_degrees(self, g, algorithm='magma'):
+        """
+        Return a list of possible degrees
+        """
+        if algorithm == 'magma':
+            try:
+                G = magma.CoxeterGroup('"B%d"'%g)
+            except TypeError: # magma not installed
+                algorithm = 'gap'
+            else:
+                subgps = [magma('%s`subgroup'%(c.name())) for c in G.Subgroups()]
+                # AbelianQuotientInvariants works for PCGroups but not PermGroups
+                structures = set(tuple(map(ZZ, H.AbelianQuotient().AbelianInvariants())) for H in subgps)
+                # May also need to allow quotients
+        if algorithm == 'gap':
+            G = WeylGroup(["B", g]).gap()
+            subgps = G.ConjugacyClassesSubgroups()
+            structures = set(tuple(map(ZZ, H.Representative().AbelianInvariants())) for H in subgps)
+        return sorted(set(sum((self.inverse_structure(ED1+ED2) for ED1,ED2 in combinations_with_replacement(structures,2)), [])))
 
 # These functions extend cremona codes to negative integers (prepending an a)
 
@@ -1570,6 +1801,10 @@ class IsogenyClass(PGSaver):
     def p_rank(self):
         return self.slopes.count(0)
 
+    @pg_smallint
+    def p_rank_deficit(self):
+        return self.g - self.p_rank
+
     @pg_float8_list
     def angles(self):
         """
@@ -2016,33 +2251,7 @@ class IsogenyClass(PGSaver):
         r"""
         The smallest degree of field ext where all endomorphism are defined
         """
-        Lpoly, g, q = self.Lpoly, self.g, self.q
-        x = Lpoly.parent().gen()
-
-        square = tensor_charpoly(Lpoly,Lpoly)(x/q)
-        # There seems to be a difficult-to-diagnose bug in factor, which causes
-        # PariError: bug in gerepile, significant pointers lost, please report
-        # Scaling square so that it has integral coefficients helps but
-        # doesn't completely solve the problem.
-        square *= square.denominator()
-
-        try:
-            factors = square.factor()
-        except PariError:
-            print "Pari error in %s" % self.label
-            # Try to work around the bug using squarefree decomposition
-            sqfree = square.squarefree_decomposition()
-            factors = []
-            for fac, e in sqfree:
-                for subfac, sube in fac.factor():
-                    factors.append((subfac, e*sube))
-        fieldext = ZZ(1)
-        for factor, power in factors:
-            m = Cyclotomic().order(factor)
-            if m > 0:
-                fieldext = fieldext.lcm(m)
-
-        return fieldext
+        return lcm(hom_degrees(self.Lpoly, self.Lpoly, self.q))
 
     @pg_text_list
     def primitive_models(self):
@@ -2788,3 +2997,46 @@ def extract_bad():
                 if i in bad_lines:
                     print i
                     Fout.write(line)
+
+def actual_twist_deg(A, B, g, q, show=False):
+    # A and B should be L-polynomials
+    x = A.parent().gen()
+    square = tensor_charpoly(A,B)(x/q)
+    if show: print square
+    fieldext = ZZ(1)
+    for factor, power in square.factor():
+        m = Cyclotomic().order(factor)
+        if m > 0:
+            if show: print factor, m
+            fieldext = fieldext.lcm(m)
+    if base_change(A, fieldext, g=g, q=q) == base_change(B, fieldext, g=g, q=q):
+        return fieldext
+
+def check_pair_lcms(g, q):
+    from itertools import combinations
+    results = set()
+    R = ZZ['x']
+    data = list(db.av_fq_isog.search({'g':g, 'q':q}, ['label', 'poly', 'geometric_extension_degree', 'twists']))
+    print len(data)
+    for A, B in combinations(data, 2):
+        Atwists = [rec[0] for rec in A['twists']]
+        Btwists = [rec[0] for rec in B['twists']]
+        actual = actual_twist_deg(R(A['poly']), R(B['poly']), g, q)
+        if actual is not None:
+            results.add(actual)
+        #if actual is None:
+        #    if A['label'] in Btwists:
+        #        print A['label'], "NOT a twist of", B['label']
+        #    if B['label'] in Atwists:
+        #        print B['label'], "NOT a twist of", A['label']
+        #else:
+        #    if A['label'] not in Btwists:
+        #        print A['label'], "IS a twist of", B['label']
+        #    if B['label'] not in Atwists:
+        #        print B['label'], "IS a twist of", A['label']
+        #    results.add(actual)
+            #predicted = 2*lcm(A['geometric_extension_degree'], B['geometric_extension_degree'])
+            #if predicted % actual != 0:
+            #    print A['label'], B['label'], predicted, actual
+            #    results.add((predicted, actual))
+    return results
