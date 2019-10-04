@@ -421,6 +421,7 @@ def find_twists(ICs):
     for IC1 in ICs:
         if IC1.label in seen:
             continue
+        print "Clustering", IC1.label
         seen.add(IC1.label)
         clusters.append([IC1])
         for IC2 in ICs:
@@ -430,12 +431,15 @@ def find_twists(ICs):
             if mtwists:
                 seen.add(IC2.label)
                 clusters[-1].append(IC2)
+                print len(clusters[-1]),
                 twists[IC1, IC2] = mtwists
+        print ""
     # We've now broken up the input into clusters; we fill out
     # the minimal twist degrees within each cluster
     for C in clusters:
         IC1 = C[0]
         for IC2, IC3 in combinations(C[1:], 2):
+            print "Minimal twists", IC2.label, IC3.label
             deg2 = [d for d,bc in twists[IC1, IC2]]
             deg3 = [d for d,bc in twists[IC1, IC3]]
             max_degs = []
@@ -444,6 +448,7 @@ def find_twists(ICs):
                     max_degs.append(a*b)
             twists[IC2, IC3] = minimal_twists(IC2, IC3, max_degs=max_degs, BC=BC)
     # Now construct the return value
+    print "Finishing..."
     twist_lists = defaultdict(list)
     for IC1, IC2 in combinations(ICs, 2):
         twist_lists[IC1.label].extend([(IC2, base_change, d) for (d, base_change) in twists[IC1, IC2]])
