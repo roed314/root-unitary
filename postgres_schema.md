@@ -19,6 +19,16 @@ dim2_distinct                | smallint   | Number of distinct dimension 2 facto
 dim3_distinct                | smallint   | Number of distinct dimension 3 factors
 dim4_distinct                | smallint   | Number of distinct dimension 4 factors
 dim5_distinct                | smallint   | Number of distinct dimension 5 factors
+geom_dim1_factors            | smallint   | Number of dimension 1 factors
+geom_dim2_factors            | smallint   | Number of dimension 2 factors
+geom_dim3_factors            | smallint   | Number of dimension 3 factors
+geom_dim4_factors            | smallint   | Number of dimension 4 factors
+geom_dim5_factors            | smallint   | Number of dimension 5 factors
+geom_dim1_distinct           | smallint   | Number of distinct dimension 1 factors
+geom_dim2_distinct           | smallint   | Number of distinct dimension 2 factors
+geom_dim3_distinct           | smallint   | Number of distinct dimension 3 factors
+geom_dim4_distinct           | smallint   | Number of distinct dimension 4 factors
+geom_dim5_distinct           | smallint   | Number of distinct dimension 5 factors
 poly                         | integer[]  | Coefficients of the Weil polynomial.  The first will always be `1` and the last `q^g`
 real_poly                    | integer[]  | Coefficients of the real Weil polynomial, whose roots are the traces down to R of the roots of the Weil polynomial
 angles                       | float8[]   | Angles corresponding to roots in the closure of the upper half plane, divided by `pi`.  All will be in the interval `[0, 1]`, and there will be `g` of them unless `0` or `1` is included.
@@ -33,6 +43,8 @@ curve_count                  | integer    | The count `#C(F_q)`, duplicated for 
 has_jacobian                 | smallint   | 1 if it is known that this isogeny class contains a Jacobian; -1 if it is known that it does not; 0 otherwise
 has_principal_polarization   | smallint   | 1 if it is known that this isogeny class contains a principally polarizable abelian variety; -1 if it is known that it does not; 0 otherwise
 is_simple                    | boolean    |
+is_geometrically_simple      | boolean    |
+is_supersingular             | boolean    |
 simple_factors               | text[]     | A list of labels of simple factors.  Duplicated factors will have "A", "B", etc appended.
 simple_distinct              | text[]     | A list of distinct labels of simple factors.
 simple_multiplicities        | smallint[] | For each distinct simple factor, the multiplicity in the decomposition.
@@ -59,6 +71,8 @@ ideal_class_generators       | text[]     | A list of `isom_letters` for isomorp
 ideal_class_relations        | integer[]  | A matrix of positive integers giving relations between the ideal class generators
 cm_type             | boolean[]  | Whether the +imaginary embedding is a p-adic non-unit, for embeddings sorted by real part
 cm_elt              | numeric[]  | An element of Q[F] that is positive imaginary under each embedding in the CM type
+curves              | text[]     | A list of curves in this isogeny class
+hyp_count           | integer    | The number of isomorphism classes of Jacobians of hyperelliptic curves within this isogeny class (isomorphisms of polarized abelian varieties)
 
 Table name: `av_fq_endalg_factors`
 
@@ -99,6 +113,7 @@ isog_label                   | text      | label for the isogeny class
 ideal_basis_numerators       | numeric[] | Z-basis for the chosen representative of weak equivalence class, after scaling by the denominator
 ideal_basis_denominator      | numeric   | denominator for coefficients in the Z-basis (will be a divisor of the index of the Frobenius order in the maximal order)
 is_invertible                | boolean   | Invertible in its multiplicator ring
+is_gorenstein                | boolean   | Whether the multiplicator ring is Gorenstein
 inverting_element            | numeric[] | When invertible, an element x so that I/x is the ring (null if not invertible), expressed in terms of `V^g,...,V,1,F,F^2,...,F^{g-1}`
 minimal_overorders           | smallint[] | list of `we_numbers` for minimal overorders
 
