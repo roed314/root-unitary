@@ -534,7 +534,7 @@ class Cyclotomic(UniqueRepresentation):
         """
         mbound = self.get_mbound(nbound)
         if poly:
-            for m in range(self.poly_mbound, mbound):
+            for m in srange(self.poly_mbound, mbound):
                 f = cyclotomic_polynomial(m)
                 self.polynomials[f] = m
                 if m >= self.order_mbound:
@@ -542,7 +542,7 @@ class Cyclotomic(UniqueRepresentation):
             self.poly_nbound = max(nbound, self.poly_nbound)
             self.poly_mbound = max(mbound, self.poly_mbound)
         else:
-            for m in range(self.order_mbound, mbound):
+            for m in srange(self.order_mbound, mbound):
                 self.orders[euler_phi(m)].append(m)
         self.order_nbound = max(nbound, self.order_nbound)
         self.order_mbound = max(mbound, self.order_mbound)
@@ -616,7 +616,7 @@ class BasechangeCache(object):
         Compute the base change to all divisors of s, and to all entries in the list rs
         """
         s = ZZ(s)
-        q = self.q
+        g, q = self.g, self.q
         def _seed(n, fac):
             if not fac:
                 return
@@ -826,18 +826,20 @@ class pg_bccache(PGType):
     def __init__(self, func=None, internal=True):
         PGType.__init__(self, func, internal)
     def load(self, x):
-        return BasechangeCache(sage_eval(x))
+        return BasechangeCache(sage_eval(x.replace('{','[').replace('}',']')))
     def save(self, x):
-        return PGType.save(x.save())
+        return PGType.save(self, x.save())
 
 class GenericTask(object):
     primeonly = False # if this task should be executed for each prime, rather than each prime power
-    def __init__(self, stage, g, q, i=None, chunksize=None):
+    def __init__(self, stage, g, q, i='', chunksize=None):
         self.g, self.q, self.stage, self.i = g, q, stage, i
         if chunksize is not None:
             self.chunksize = chunksize
         self.kwds = {'g':g, 'q':q, 'i':i}
-        self.logheader = stage.controller.logheader.format(g=g, q=q, name=stage.shortname)
+    @lazy_attribute
+    def logheader(self):
+        return self.stage.controller.logheader.format(g=self.g, q=self.q, i=self.i, name=self.stage.shortname)
     @staticmethod
     def _done(filename):
         return filename.replace('.txt', '.done')
@@ -861,6 +863,10 @@ class GenericTask(object):
         s = str(s).strip()
         s += " (%s)" % (datetime.utcnow() - self.t0)
         s += '\n'
+        if isinstance(self, GenericAccumulator):
+            s = "[A] " + s
+        elif self.i != '':
+            s = "[%s] " % self.i + s
         with open(self._logfile, 'a') as F:
             F.write(s)
     @lazy_attribute
@@ -870,7 +876,7 @@ class GenericTask(object):
         """
         return [(None, filename.format(**self.kwds)) for filename in self.stage.input]
     def load(self, *args, **kwds):
-        if self.i is not None and not kwds.pop('loadall',False):
+        if self.i != '' and not kwds.pop('loadall',False):
             kwds['start'] = start = self.i * self.chunksize
             kwds['stop'] = start + self.chunksize
         return self.stage.controller.load(*args, **kwds)
@@ -919,13 +925,14 @@ class GenericSpawner(GenericTask):
     @lazy_attribute
     def chunksize(self):
         try:
-            return self.stage.controller.cfgp.get(self.stage.__class__.__name__, 'chunksize')
+            return ZZ(self.stage.controller.cfgp.get(self.stage.__class__.__name__, 'chunksize'))
         except NoOptionError:
             return 10000
 
     @lazy_attribute
     def numlines(self):
         infile = self.input_data[0][1]
+        i = 0
         with open(infile) as Fin:
             for i, line in enumerate(Fin, -2): #We subtract 3 due to header lines
                 pass
@@ -947,7 +954,7 @@ class GenericSpawner(GenericTask):
         stage = self.stage
         N = self.num_subtasks
         subtasks = [stage.Task(stage, self.g, self.q, i=i, chunksize=self.chunksize) for i in range(N)]
-        subtasks.append(stage.Accumulator(stage, self.g, self.q))
+        subtasks.append(stage.Accumulator(stage, self.g, self.q, i=N))
         return subtasks
 
 class GenericAccumulator(GenericTask):
@@ -959,22 +966,29 @@ class GenericAccumulator(GenericTask):
     delete_tmp_files = True
 
     @lazy_attribute
+    def logheader(self):
+        return self.stage.controller.logheader.format(g=self.g, q=self.q, name=self.stage.shortname+'Accum')
+
+    @lazy_attribute
     def input_data(self):
         idata = []
         g, q = self.g, self.q
         for ofile, accum, odata in self.stage.output:
             for i in range(self.i):
                 idata.append((ofile.format(g=g, q=q, i=''), ofile.format(g=g, q=q, i=i)))
+        return idata
 
     def run(self):
         outF = {}
         # In a simple case we can just move/copy the file
-        if write_header and not remove_duplicates and len(self.input_data) == 1:
+        if self.write_header and not self.remove_duplicates and len(self.input_data) == 1:
             new, old = self.input_data[0]
-            if delete_tmp_files:
+            if self.delete_tmp_files:
                 os.rename(old, new)
+                os.rename(old.replace('.txt', '.done'), new.replace('.txt', '.done'))
             else:
                 shutil.copy(old, new)
+                self.stage.controller._finish(new, self.t0)
             return
         if self.remove_duplicates:
             seen = defaultdict(set)
@@ -987,11 +1001,13 @@ class GenericAccumulator(GenericTask):
                 with open(ifile) as Fin:
                     for i, line in enumerate(Fin):
                         if (i <= 2 and need_header or
-                            i > 2 and (not remove_duplicates or line not in seen[ofile])):
+                            i > 2 and (not self.remove_duplicates or line not in seen[ofile])):
                             Fout.write(line)
-                            if i > 2 and remove_duplicates:
+                            if i > 2 and self.remove_duplicates:
                                 seen[ofile].add(line)
                 need_header = False
+            for ofile in outF:
+                self.stage.controller._finish(ofile, self.t0)
         finally:
             for Fout in outF.values():
                 if not Fout.closed:
@@ -1000,6 +1016,7 @@ class GenericAccumulator(GenericTask):
         if self.delete_tmp_files:
             for ofile, ifile in self.input_data:
                 os.remove(ifile)
+                os.remove(ifile.replace('.txt', '.done'))
 
 class GenericBigAccumulator(GenericAccumulator):
     """
@@ -1007,7 +1024,11 @@ class GenericBigAccumulator(GenericAccumulator):
     """
     delete_tmp_files = False
     def __init__(self, stage):
-        GenericAccumulator.__init__(self, stage, 0, 0)
+        GenericAccumulator.__init__(self, stage, 0, 0, i=1)
+
+    @lazy_attribute
+    def logheader(self):
+        return self.stage.controller.logheader.format(g=self.g, q=self.q, name=self.stage.shortname+'BigAccum')
 
     @lazy_attribute
     def gq(self):
@@ -1087,7 +1108,7 @@ class Controller(object):
                 data_indexes = data = []
             if output_indexes != data_indexes:
                 raise ValueError("Output and data specifications need to be in the same order for %s.\nOne was %s while the other was %s" % (stage, ', '.join(output_indexes), ', '.join(data_indexes)))
-            accum = {key[3:]: opj(basedir, val) for (key, val) in info if key.startswith('accum')}
+            accum = {key[5:]: opj(basedir, val) for (key, val) in info if key.startswith('accum')}
             accum = [accum.get(i) for i in output_indexes]
             output = zip(output, accum, data)
             stages.append(getattr(self.__class__, stage)(self, input=input, output=output))
@@ -1114,52 +1135,126 @@ class Controller(object):
 
     def run_serial(self):
         tasks = copy(self.tasks)
-        i = 0
-        while i < len(tasks):
-            task = tasks[i]
+        while tasks:
+            task = tasks.pop(0)
             if task.done():
                 print "Already complete " + task.logheader
             elif isinstance(task, GenericSpawner):
                 print "Spawning " + task.logheader
-                tasks[i:i] = task.spawn()
+                tasks[0:0] = task.spawn()
                 continue
             else:
                 print "Starting " + task.logheader
                 task._run()
-            i += 1
 
     def run_parallel(self, worker_count=8):
         processes = {}
         pcounter = 0
         tasks = copy(self.tasks)
-        while tasks or processes:
-            # start processes
-            i = 0
-            while i < len(tasks) and len(processes) < worker_count:
-                if tasks[i].done():
-                    task = tasks.pop(i)
-                    print "Already complete " + task.logheader
-                elif tasks[i].ready():
-                    task = tasks.pop(i)
-                    if isinstance(task, GenericSpawner):
-                        # Note that the spawning is done in the master process,
-                        # so make sure it's not slow!
-                        print "Spawning " + task.logheader
-                        tasks[i:i] = task.spawn()
+        try:
+            while tasks or processes:
+                # start processes
+                i = 0
+                while i < len(tasks) and len(processes) < worker_count:
+                    if tasks[i].done():
+                        task = tasks.pop(i)
+                        print "Already complete " + task.logheader
+                    elif tasks[i].ready():
+                        task = tasks.pop(i)
+                        if isinstance(task, GenericSpawner):
+                            # Note that the spawning is done in the master process,
+                            # so make sure it's not slow!
+                            print "Spawning " + task.logheader
+                            tasks[i:i] = task.spawn()
+                        else:
+                            P = Process(target=task._run)
+                            print "Starting " + task.logheader
+                            P.start()
+                            processes[pcounter] = (P, task)
+                            pcounter += 1
                     else:
-                        P = Process(target=task._run)
-                        print "Starting " + task.logheader
-                        P.start()
-                        processes[pcounter] = (P, task)
-                        pcounter += 1
+                        i += 1
+                time.sleep(0.1)
+                # finish processes
+                for p, (P, task) in list(processes.items()):
+                    if not P.is_alive():
+                        processes.pop(p)
+                        print "Finished " + task.logheader
+        except KeyboardInterrupt:
+            # help in debugging
+            return tasks
+
+    def status(self):
+        """
+        Prints a status report on the computation.  Intended for use
+        when the computation is running in another process.
+        """
+        by_stage = defaultdict(list)
+        for task in self.tasks:
+            by_stage[task.stage].append(task)
+        for stage in self.stages:
+            done = defaultdict(lambda: defaultdict(list))
+            ready = defaultdict(lambda: defaultdict(list))
+            unready = defaultdict(lambda: defaultdict(list))
+            for task in by_stage[stage]:
+                if task.done():
+                    done[task.g][task.q].append(task)
+                elif task.ready():
+                    ready[task.g][task.q].append(task)
                 else:
-                    i += 1
-            time.sleep(0.1)
-            # finish processes
-            for p, (P, task) in list(processes.items()):
-                if not P.is_alive():
-                    processes.pop(p)
-                    print "Finished " + task.logheader
+                    unready[task.g][task.q].append(task)
+            if not ready and not unready:
+                print stage.name, "complete"
+            elif not ready and not done:
+                pass # Not ready to start this stage
+            else:
+                print stage.name, "in progress"
+                if done:
+                    all_done = defaultdict(set)
+                    for g, qs in done.items():
+                        for q in qs:
+                            if q not in ready[g] and q not in unready[g]:
+                                all_done[g].add(q)
+                    if all_done:
+                        print " Complete:"
+                        for g, qs in sorted(all_done.items()):
+                            print "  g=%s - q="%g + ",".join(map(str, sorted(qs)))
+                    if ready:
+                        if any(ready.values()):
+                            print " Ready:"
+                        for g, qs in sorted(ready.items()):
+                            if qs:
+                                print "  g=%s - q="%g + ",".join(map(str, sorted(qs)))
+                        in_progress = []
+                        for g, by_g in ready.items():
+                            for q, by_q in by_g.items():
+                                for task in by_q:
+                                    if any(ope(outfile.format(**task.kwds)) for outfile, accum, attributes in stage.output):
+                                        in_progress.append(task)
+                                    elif isinstance(task, GenericSpawner):
+                                        subtasks = task.spawn()
+                                        for stask in subtasks:
+                                            if stask.ready() and not stask.done() and any(ope(outfile.format(**stask.kwds)) for outfile, accum, attributes in stage.output):
+                                                in_progress.append(stask)
+                        in_progress.sort(key=lambda task: (task.g, task.q))
+                        if in_progress:
+                            print " Writing files:"
+                        for task in in_progress:
+                            for outfile, accum, attributes in stage.output:
+                                outfile = outfile.format(**task.kwds)
+                                if ope(outfile):
+                                    with open(outfile) as F:
+                                        for lineno, line in enumerate(F):
+                                            pass
+                                    if lineno > 3:
+                                        print " ", outfile, lineno
+                                        try:
+                                            with open(task._logfile) as F:
+                                                for line in F:
+                                                    pass
+                                            print " "*(len(outfile)+2), line.strip()
+                                        except IOError:
+                                            pass
 
 class IsogenyClasses(Controller):
     """
@@ -1236,7 +1331,7 @@ class IsogenyClasses(Controller):
         This function is intended to be called before run_parallel() in order to
         ensure that a column hasn't been missed somewhere.
         """
-        db = PostgresDatabase()
+        db = get_db()
         for stage, data, table, cls in [
                 ('StageCompute', 'data0', 'av_fq_endalg_factors', BaseChangeRecord),
                 ('StageCompute', 'data1', 'av_fq_endalg_data', None),
@@ -1269,10 +1364,9 @@ class IsogenyClasses(Controller):
         shortname = 'LFields'
         class Task(GenericTask):
             def run(self):
-                db = PostgresDatabase()
                 maxg = 6 #max(g for (g,q) in self.stage.controller.gq)
                 def make_all():
-                    for rec in db.nf_fields.search({'cm':True, 'degree':{'$lte':2*maxg, '$gte':4}}, projection=['label', 'coeffs', 'degree', 'galt']):
+                    for rec in get_db().nf_fields.search({'cm':True, 'degree':{'$lte':2*maxg, '$gte':4}}, projection=['label', 'coeffs', 'degree', 'galt']):
                         yield FieldRecord(rec)
                 self.save(make_all())
 
@@ -1285,13 +1379,11 @@ class IsogenyClasses(Controller):
         class Task(GenericTask):
             def run(self):
                 g, q = self.g, self.q
-                nfdb = NFDB(self.load(self.input_data[0][1], cls=FieldRecord))
                 def make_simples():
                     R = ZZ['x']
                     for Ppoly in self.enumerate(WeilPolynomials(2*g, q)):
                         Lpoly = R(Ppoly.reverse())
                         IC = IsogenyClass(Lpoly=Lpoly)
-                        IC.nfdb = nfdb
                         try:
                             invs, mult = IC.simplepow_brauer_data
                         except ValueError:
@@ -1313,10 +1405,9 @@ class IsogenyClasses(Controller):
             def input_data(self):
                 gs = range(1, self.g+1)
                 q = self.q
-                return [(None, self.stage.input[1])] + [(g, self.stage.input[0].format(g=g, q=q)) for g in gs]
+                return [(g, self.stage.input[0].format(g=g, q=q)) for g in gs]
             def run(self):
-                nfdb = NFDB(self.load(self.input_data[0][1], cls=FieldRecord))
-                simples = {g: list(self.load(filename, nfdb=nfdb)) for (g, filename) in self.input_data[1:]}
+                simples = {g: list(self.load(filename)) for (g, filename) in self.input_data}
                 self.log("Loaded")
                 def make_all():
                     for split in Partitions(self.g):
@@ -1345,21 +1436,23 @@ class IsogenyClasses(Controller):
             remove_duplicates = True
         class Task(GenericTask):
             def run(self):
-                nfdb = NFDB(self.load(self.input_data[1][1], cls=FieldRecord, loadall=True))
                 qs = [q for (g,q) in self.stage.controller.gq if g == self.g and q.is_power_of(self.q)]
                 rs = [q.exact_log(self.q) for q in qs]
                 ICs = []
                 simple_factors = {}
                 multiplicity_records = []
-                for IC in self.load(self.input_data[0][1], nfdb=nfdb):
+                for IC in self.enumerate(self.load(self.input_data[0][1])):
                     s = IC.geometric_extension_degree
                     IC.basechange.seed(s, rs)
                     for d in s.divisors():
                         BC = IsogenyClass(Lpoly=IC.basechange[d])
-                        BC.nfdb = nfdb
                         # We don't want to have to recompute polredabs from scratch
                         # So we use the known polredabs for IC to give a hint to BC
-                        BC.polred_hint(IC.polred_coeffs)
+                        if d == 1:
+                            BC.polred_coeffs = IC.polred_coeffs
+                            BC.decomposition = IC.decomposition
+                        else:
+                            BC.polred_hint(IC.polred_coeffs)
                         for simple_factor, mult in BC.decomposition:
                             SFL = simple_factor.label
                             BCR = BaseChangeRecord(IC.label, SFL, d, mult)
@@ -1387,10 +1480,9 @@ class IsogenyClasses(Controller):
         shortname = 'UFields'
         class Task(GenericTask):
             def run(self):
-                db = PostgresDatabase()
                 def make_all():
                     for IC in self.enumerate(self.load(self.input_data[0][1])):
-                        rec = UnknownFieldRecord(IC, db=db)
+                        rec = UnknownFieldRecord(IC)
                         if rec.label is None:
                             yield rec
                 self.save(make_all())
@@ -1444,7 +1536,7 @@ class IsogenyClasses(Controller):
                     nfs_count = Counter()
                     infile = self.input_data[-1][1]
                     for IC in self.load(infile):
-                        nfs_count[tuple(sorted(IC.geometric_number_fields))] += 1
+                        nfs_count[tuple(sorted(set(IC.geometric_number_fields)))] += 1
                     inv = defaultdict(list)
                     for nfs, count in nfs_count.items():
                         inv[count].append(nfs)
@@ -1468,18 +1560,20 @@ class IsogenyClasses(Controller):
                             nfs_clusters[i].append(nfs)
                             heapq.heapreplace(nfs_heap, (size+count, i))
                     subtasks = [stage.Task(stage, self.g, self.q, i=i, nfs=nfsL) for (i,nfsL) in enumerate(nfs_clusters)]
-                return subtasks + [self.Accumulator(stage, self.g, self.q)]
+                return subtasks + [stage.Accumulator(stage, self.g, self.q, i=len(subtasks))]
 
         class Task(BCTask):
             def __init__(self, *args, **kwds):
-                self.nfs = set(kwds.pop('nfs', None))
-                BCTask.__init__(self, *args, **kwds)
+                self.nfs = kwds.pop('nfs', None)
+                if self.nfs is not None:
+                    self.nfs = set(self.nfs)
+                super(self.__class__, self).__init__(*args, **kwds)
             def run(self):
                 process = psutil.Process(os.getpid())
                 g, q, r = self.g, self.q, self.rs[-1]
                 by_Lpoly = defaultdict(dict)
                 for IC in self.load(self.input_data[-1][1], loadall=True):
-                    gnf = tuple(sorted(IC.geometric_number_fields))
+                    gnf = tuple(sorted(set(IC.geometric_number_fields)))
                     if self.nfs is None or gnf in self.nfs:
                         by_Lpoly[r][IC.Lpoly] = IC
                         IC.primitive_models = []
@@ -1488,19 +1582,21 @@ class IsogenyClasses(Controller):
                         by_Lpoly[rr][IC.Lpoly] = IC
                         IC.primitive_models = []
                 for rr in self.rs[:-1]:
-                    for IC in by_Lpoly[rr]:
+                    for IC in by_Lpoly[rr].values():
                         if not IC.primitive_models: # IC is itself primitive
                             for d in (r // rr).divisors():
                                 BC = by_Lpoly[d*rr].get(IC.basechange[d*rr])
                                 if BC is not None:
                                     BC.primitive_models.append(IC)
                 clusters = defaultdict(list)
-                for IC in by_Lpoly[r]:
+                for IC in by_Lpoly[r].values():
                     IC.primitive_models.sort(key=lambda mod: (mod.q, mod.poly))
+                    IC.primitive_models = [mod.label for mod in IC.primitive_models]
                     # Now we compute twists.  We first use invariants to split the ICs up into clusters
-                    clusters[tuple(sorted(IC.geometric_number_fields)), tuple(IC.slopes)].append(IC)
+                    clusters[tuple(sorted(set(IC.geometric_number_fields))), tuple(IC.slopes)].append(IC)
                 for cluster in clusters.values():
                     find_twists(cluster)
+                self.save(by_Lpoly[r].values())
 
     class StageCombine(Stage):
         """
@@ -1564,7 +1660,6 @@ class IsogenyClasses(Controller):
         shortname = 'DBLoad'
         class Task(GenericTask):
             def run(self):
-                db = PostgresDatabase()
                 outfile, accum, data = self.stage.output[0]
                 outfile = outfile.format(g=self.g, q=self.q)
                 cols = [(attr.__name__, attr.pg_type) for attr in IsogenyClass.__dict__.values() if isinstance(attr, PGType)]
@@ -1572,7 +1667,7 @@ class IsogenyClasses(Controller):
                 selecter = SQL("SELECT {0} FROM av_fq_isog WHERE g={1} AND q = {2}").format(SQL(", ").join(map(Identifier, col_names)), Literal(self.g), Literal(self.q))
                 self.log('DBloaded')
                 header = "%s\n%s\n\n" % (":".join(col_names), ":".join(col_types))
-                db._copy_to_select(selecter, outfile, header=header, sep=":")
+                get_db()._copy_to_select(selecter, outfile, header=header, sep=":")
                 self.stage.controller._finish(outfile, self.t0)
 
     class StagePolyOut(Stage):
@@ -1586,7 +1681,38 @@ class IsogenyClasses(Controller):
             def run(self):
                 self.save(self.load(self.input_data[0][1]))
 
-    def load(self, filename, start=None, stop=None, cls=None, allow_empty=False, nfdb=None):
+    class StageParseTwists(Stage):
+        name = 'ParseTwists'
+        shortname = 'Twists'
+        class Task(GenericTask):
+            def run(self):
+                clusters = defaultdict(set)
+                size = Counter()
+                for IC in self.load(self.input_data[0][1]):
+                    key = None
+                    for JC, BC, d in IC.twists:
+                        if JC in clusters:
+                            key = JC
+                            break
+                    else:
+                        key = IC.label
+                    size[key] += 1
+                    for JC, BC, d in IC.twists:
+                        clusters[key].add(d)
+                TS = []
+                count = Counter()
+                rep = {}
+                for key, cluster in clusters.items():
+                    cluster = tuple(sorted(cluster))
+                    count[size[key],cluster] += 1
+                    if cluster not in rep:
+                        rep[size[key],cluster] = key
+                for n, cluster in count:
+                    TS.append(TwistStats(self.g, self.q, cluster, count[n,cluster], n, rep[n,cluster]))
+                TS.sort(key = lambda x: (len(x.twist_degs), (max(x.twist_degs) if x.twist_degs else 1, x.size)))
+                self.save(TS)
+
+    def load(self, filename, start=None, stop=None, cls=None, allow_empty=False):
         """
         Iterates over all of the isogeny classes stored in a file.
         The data contained in the file is specified by header lines: the first giving the
@@ -1611,16 +1737,14 @@ class IsogenyClasses(Controller):
                 for i, line in enumerate(F):
                     if i == 0:
                         header = line.strip().split(':')
-                    elif i >= 3 and (start is None or i-3 >= start) and (stop is None or i-3 < start):
+                    elif i >= 3 and (start is None or i-3 >= start) and (stop is None or i-3 < stop):
                         out = cls.load(line.strip(), header)
-                        if nfdb is not None:
-                            out.nfdb = nfdb
                         yield out
         elif not allow_empty:
             raise ValueError("%s does not exist" % (filename))
 
     def _finish(self, outfile, t0):
-        donefile = outfile[:-4] + '.done'
+        donefile = outfile.replace('.txt', '.done')
         with open(donefile, 'w') as F:
             F.write(str(datetime.utcnow() - t0)+'\n')
 
@@ -2088,14 +2212,12 @@ class IsogenyClass(PGSaver):
         """
         A dictionary-analogue for caching calls to basechange
         """
-        return BasechangeCache({1:self.Lpoly})
+        return BasechangeCache([[1,self.poly]])
 
     @lazy_attribute
     def geometric_basechange(self):
         g, q, s = self.g, self.q, self.geometric_extension_degree
         IC = IsogenyClass(Lpoly=self.basechange[s])
-        if hasattr(self, "nfdb"):
-            IC.nfdb = self.nfdb
         return IC
 
     @pg_boolean
@@ -2180,7 +2302,7 @@ class IsogenyClass(PGSaver):
         - ``hint`` -- the ``polred_coeffs`` attribute for a primitive model of this isogeny class.
         """
         F = self.Ppoly_factors
-        if len(F) == 1:
+        if len(F) == 1 and len(hint) == 1:
             if F[0][0].degree() == len(hint[0]) - 1:
                 # degree didn't drop
                 self.polred_coeffs = hint
@@ -2213,23 +2335,23 @@ class IsogenyClass(PGSaver):
                         K = NumberField(f, 'a')
                         for L in nf_hint.get(a, []):
                             if K.is_isomorphic(L):
-                                polred_coeffs[i] = list(L.polynomial())
+                                polred_coeffs[i] = map(ZZ, L.polynomial())
                                 break
                     else:
                         # Just have to match
                         if len(bydeg_hint[a]) == 1:
-                            polred_coeffs[i] = list(bydeg_hint[a][0])
+                            polred_coeffs[i] = map(ZZ, bydeg_hint[a][0])
                         else:
                             D = f.discriminant()
-                            poss = [f for f in bydeg_hint[a] if (disc_dict[f] / D).is_square()]
+                            poss = [ff for ff in bydeg_hint[a] if (disc_dict[ff] / D).is_square()]
                             if len(poss) == 1:
-                                polred_coeffs[i] = list(poss[0])
+                                polred_coeffs[i] = map(ZZ, poss[0])
                             else:
                                 K = NumberField(f, 'a')
                                 for ff in poss:
                                     L = NumberField(ff, 'a')
                                     if K.is_isomorphic(L):
-                                        polred_coeffs[i] = list(ff)
+                                        polred_coeffs[i] = map(ZZ, ff)
                                         break
             for i, ((f, e), polred_f) in enumerate(zip(F, polred_coeffs)):
                 if polred_f is None:
@@ -2251,10 +2373,8 @@ class IsogenyClass(PGSaver):
                 rec = {'label':'2.%s.%s.1' % (sig, abs(disc)),
                        'degree':2,
                        'galt':1}
-            elif hasattr(self, 'nfdb'):
-                rec = self.nfdb.get(tuple(coeffs))
             else:
-                rec = PostgresDatabase().nf_fields.lucky({'coeffs':coeffs}, projection=['label','degree','galt'], sort=[])
+                rec = get_db().nf_fields.lucky({'coeffs':coeffs}, projection=['label','degree','galt'], sort=[])
             if rec is None: # not in LMFDB
                 nfs.append(r'\N')
                 gals.append(r'\N')
@@ -2363,7 +2483,10 @@ class IsogenyClass(PGSaver):
         return len(self.twists)
     @pg_integer
     def max_twist_degree(self):
-        return max(deg for JClabel, BClabel, deg in self.twists)
+        if not self.twists:
+            return ZZ(1)
+        else:
+            return max(deg for JClabel, BClabel, deg in self.twists)
 
     # The following columns are used in av_fq_endalg_data as synonyms
 
@@ -2877,10 +3000,10 @@ for d in range(1,6):
         return len([simp_label for simp_label in self.simple_distinct if simp_label.split('.')[0] == str(d)])
     def geom_dim_factors(self, d=d):
         # Set in base change stage
-        return self.geometric_basechange.dim_factors(d=d)
+        return getattr(self.geometric_basechange, "dim%d_factors"%d)
     def geom_dim_distinct(self, d=d):
         # Set in base change stage
-        return self.geometric_basechange.dim_distinct(d=d)
+        return getattr(self.geometric_basechange, "dim%d_distinct"%d)
     dim_factors.__name__ = 'dim%d_factors'%d
     dim_distinct.__name__ = 'dim%d_distinct'%d
     geom_dim_factors.__name__ = 'geom_dim%d_factors'%d
@@ -2919,15 +3042,13 @@ class UnknownFieldRecord(PGSaver):
     """
     This class is used to output data for adding new fields to the LMFDB
     """
-    def __init__(self, IC, db=None):
+    def __init__(self, IC):
         if not IC.is_simple:
             raise ValueError("UnknownFieldRecord requires a simple isogeny class")
-        if db is None:
-            db = PostgresDatabase()
         self.f = f = IC.polred_polynomials[0]
         self.coeffs = coeffs = IC.polred_coeffs[0]
         self.K = NumberField(f, 'a')
-        self.label = db.nf_fields.lucky({'coeffs':coeffs}, projection='label')
+        self.label = get_db().nf_fields.lucky({'coeffs':coeffs}, projection='label')
     @pg_jsonb
     def data(self):
         return [self.coeffs, self.K.discriminant().support()]
@@ -2959,13 +3080,27 @@ class FieldRecord(PGSaver):
     def galt(self):
         return self._rec['galt']
 
-class NFDB(dict):
-    """
-    Used for looking up number field data loaded from a file generated by the LoadFields stage
-    """
-    def __init__(self, data):
-        for rec in data:
-            self[tuple(rec.coeffs)] = rec
+class TwistStats(PGSaver):
+    def __init__(self, g, q, twist_degs, count, size, rep):
+        self.g, self.q, self.twist_degs, self.count, self.size, self.rep = g, q, twist_degs, count, size, rep
+    @pg_smallint
+    def g(self):
+        raise RuntimeError
+    @pg_integer
+    def q(self):
+        raise RuntimeError
+    @pg_numeric_list
+    def twist_degs(self):
+        raise RuntimeError
+    @pg_integer
+    def count(self):
+        raise RuntimeError
+    @pg_text
+    def rep(self):
+        raise RuntimeError
+    @pg_integer
+    def size(self):
+        raise RuntimeError
 
 def combine_polys():
     basedir = '/scratch/importing/avfq/polys/'
@@ -3103,14 +3238,13 @@ def show_ratios():
     max_q = {1:499, 2:128, 3:9, 4:4, 5:2}
     isoms = defaultdict(int)
     totals = {}
-    db = PostgresDatabase()
     for g in range(1,6):
         for q in srange(2, 500):
             if q <= max_q[g] and q.is_prime_power():
                 filename = '/home/roed/avfq/external/isom_data/isog_sizes_g{g}_q{q}.txt'.format(g=g,q=q)
                 if ope(filename):
                     isoms[g,q] = int(check_output(['wc',filename]).split()[0])-3
-                totals[g,q] = db.av_fqisog.count({'g':g, 'q':q})
+                totals[g,q] = get_db().av_fqisog.count({'g':g, 'q':q})
     for g in range(1,6):
         for q in srange(2, 500):
             if q <= max_q[g] and q.is_prime_power():
@@ -3157,8 +3291,7 @@ def check_pair_lcms(g, q):
     from itertools import combinations
     results = set()
     R = ZZ['x']
-    db = PostgresDatabase()
-    data = list(db.av_fq_isog.search({'g':g, 'q':q}, ['label', 'poly', 'geometric_extension_degree', 'twists']))
+    data = list(get_db().av_fq_isog.search({'g':g, 'q':q}, ['label', 'poly', 'geometric_extension_degree', 'twists']))
     print len(data)
     for A, B in combinations(data, 2):
         Atwists = [rec[0] for rec in A['twists']]
@@ -3182,3 +3315,4 @@ def check_pair_lcms(g, q):
             #    print A['label'], B['label'], predicted, actual
             #    results.add((predicted, actual))
     return results
+
