@@ -107,7 +107,10 @@ pricipally_polarizable (0,1,-1): 1
 Brauer Invariants: inv_v( End(A_{FFbar_q})_{QQ} )=(v(\pi)/v(q))*[QQ(pi)_{v}: QQ(pi): v\vert p place of QQ(\pi)], these are stored as elements of QQ.
 Primitive models: 
 
-TODO: Add size to StageCombine, fix errors revealed by StageCheck
+TODO: 
+Add links from ec, ecnf, g2c
+Splitting field
+Add p, geometric_simple_multiplicities, splitting field
 """
 
 ######################################################################################################
@@ -967,7 +970,7 @@ class GenericAccumulator(GenericTask):
 
     @lazy_attribute
     def logheader(self):
-        return self.stage.controller.logheader.format(g=self.g, q=self.q, name=self.stage.shortname+'Accum')
+        return self.stage.controller.logheader.format(g=self.g, q=self.q, i='', name=self.stage.shortname+'Accum')
 
     @lazy_attribute
     def input_data(self):
@@ -1028,7 +1031,7 @@ class GenericBigAccumulator(GenericAccumulator):
 
     @lazy_attribute
     def logheader(self):
-        return self.stage.controller.logheader.format(g=self.g, q=self.q, name=self.stage.shortname+'BigAccum')
+        return self.stage.controller.logheader.format(g=self.g, q=self.q, i='', name=self.stage.shortname+'BigAccum')
 
     @lazy_attribute
     def gq(self):
@@ -1052,6 +1055,12 @@ class Stage(object):
         self.controller = controller
         self.input = input
         self.output = output
+        if hasattr(self, "Spawner"):
+            # It's easy to forget to include {i} in the output filenames
+            # If you do, all the spawned subtasks will write to the same file....
+            for ofile, accum, data in output:
+                if '{i}' not in ofile:
+                    raise RuntimeError("When a stage spawns subtasks, each output file should include {i}\nbut %s for Stage%s does not." % (ofile, self.name))
 
     @lazy_attribute
     def tasks(self):
@@ -1472,9 +1481,9 @@ class IsogenyClasses(Controller):
         but is relevant in ensuring that the ``number_fields`` and ``galois_group``
         columns are filled in.
         """
-        class Accumulator(GenericAccumulator):
+        class BigAccumulator(GenericBigAccumulator):
             remove_duplicates = True
-            delete_tmp_files = False
+            write_header = False
 
         name = 'Unknown Fields'
         shortname = 'UFields'
@@ -1482,10 +1491,45 @@ class IsogenyClasses(Controller):
             def run(self):
                 def make_all():
                     for IC in self.enumerate(self.load(self.input_data[0][1])):
-                        rec = UnknownFieldRecord(IC)
+                        rec = UnknownFieldRecord(IC.polred_coeffs[0])
                         if rec.label is None:
                             yield rec
                 self.save(make_all())
+
+    class StageSplittingFields(Stage):
+        """
+        Find splitting fields, outputting ones that are not in the LMFDB to nfs_all.txt
+        """
+        class BigAccumulator(GenericBigAccumulator):
+            remove_duplicates = True
+            write_header = False
+
+        name = 'Splitting Fields'
+        shortname = 'SFields'
+        Spawner = GenericSpawner
+        class Task(GenericTask):
+            def run(self):
+                ICs = []
+                NFs = []
+                sources = [self.load(filename) for (_, filename) in self.input_data]
+                data = defaultdict(list)
+                for source in sources:
+                    for IC in source:
+                        # We want to sort by poly since g and q are fixed
+                        data[tuple(IC.poly)].append(IC)
+                self.log("Data loaded")
+                for key in self.enumerate(sorted(data.keys())):
+                    IC = IsogenyClass.combine(data[key])
+                    ICs.append(IC)
+                    if IC.splitting_field is None:
+                        coeffs, D = IC.splitting_coeffs
+                        UFR = [UnknownFieldRecord(f, D) for f in coeffs]
+                        NFs.extend([U for U in UFR if U.label is None])
+                    if IC.geometric_splitting_field is None:
+                        coeffs, D = IC.geometric_splitting_coeffs
+                        UFR = [UnknownFieldRecord(f, D) for f in coeffs]
+                        NFs.extend([U for U in UFR if U.label is None])
+                self.save(NFs, ICs)
 
     class StageBasechange(Stage):
                 # Need to fix the following issues:
@@ -1623,7 +1667,10 @@ class IsogenyClasses(Controller):
                 def make_all():
                     for key in self.enumerate(sorted(data.keys())):
                         ICs = data[key]
-                        yield IsogenyClass.combine(ICs)
+                        # splitting_field and geometric_splitting_field might not have been added
+                        # to the LMFDB at the time the polynomials were added
+                        fix_none = ['splitting_field', 'geometric_splitting_field']
+                        yield IsogenyClass.combine(ICs, fix_none=fix_none)
                 self.save(make_all())
 
     class StageRecompute(Stage):
@@ -1817,11 +1864,10 @@ class IsogenyClass(PGSaver):
         Lpoly = prod(IC.Lpoly^e for IC,e in factors)
         result = cls(Lpoly=Lpoly)
         result.decomposition = factors
-        result.has_decomposition = True
         return result
 
     @classmethod
-    def combine(cls, inputs):
+    def combine(cls, inputs, fix_none=[]):
         """
         INPUT:
 
@@ -1835,7 +1881,7 @@ class IsogenyClass(PGSaver):
                 if key in all_attrs:
                     if val != all_attrs[key]:
                         raise ValueError("Two different values for %s: %s and %s"%(key, val, all_attrs[key]))
-                else:
+                elif key not in fix_none or val is not None:
                     all_attrs[key] = val
         IC = cls()
         for key, val in all_attrs.items():
@@ -1852,9 +1898,6 @@ class IsogenyClass(PGSaver):
             self.poly = poly
         if label is not None:
             self.label = label
-        # One of the gotchas of lazy_attributes is that hasattr triggers the computation,
-        # so we have to store the existence of the decomposition in a separate variable.
-        self.has_decomposition = False
 
     def __eq__(self, other):
         return isinstance(other, IsogenyClass) and self.Lpoly == other.Lpoly
@@ -1904,7 +1947,7 @@ class IsogenyClass(PGSaver):
     def q(self):
         return self.Ppoly[0].nth_root(self.g)
 
-    @lazy_attribute
+    @pg_smallint
     def p(self):
         p, r = self.q.is_prime_power(get_data=True)
         self.r = r
@@ -1918,7 +1961,12 @@ class IsogenyClass(PGSaver):
 
     @lazy_attribute
     def Ppoly_factors(self):
-        return self.Ppoly.factor()
+        if self.has_decomposition:
+            simples = [IsogenyClass(label=label) for label in self.simple_distinct]
+            factors = [IC.Ppoly.factor()[0] for IC in simples]
+            return [(f, e*m) for ((f, e), m) in zip(factors, self.simple_multiplicities)]
+        else:
+            return self.Ppoly.factor()
 
     @pg_rational_mults
     def slopes(self):
@@ -2161,15 +2209,16 @@ class IsogenyClass(PGSaver):
         return invs, power // e
 
     @lazy_attribute
+    def has_decomposition(self):
+        return ("decomposition" in self.__dict__) or ("simple_distinct" in self.__dict__ and "simple_multiplicities" in self.__dict__)
+
+    @lazy_attribute
     def decomposition(self):
         # We prefer to calculate from simple_distinct and simple_multiplicities
-        if not self.has_decomposition:
-            # We use the has_decomposition attribute to prevent infinite recursion
-            self.has_decomposition = True
+        if self.has_decomposition:
             return [(IsogenyClass(label=label), e) for label, e in zip(self.simple_distinct, self.simple_multiplicities)]
         else:
-            # Lazy attributes store their result as an attribute, so the only way we can reach this branch
-            # is if the other recursed back.  So we compute the decomposition from the factorization.
+            # We compute the decomposition from the factorization of Ppoly
             factorization = []
             for polred, (factor, power) in zip(self.polred_coeffs, self.Ppoly_factors):
                 Lfactor = factor.reverse()^power
@@ -2218,6 +2267,13 @@ class IsogenyClass(PGSaver):
     def geometric_basechange(self):
         g, q, s = self.g, self.q, self.geometric_extension_degree
         IC = IsogenyClass(Lpoly=self.basechange[s])
+        # fill in geometric data if already stored; relevant for splitting field computation
+        for key in ["number_fields", "center_dim", "galois_groups", "splitting_coeffs", "splitting_field"]:
+            gkey = "geometric_" + key
+            if gkey in self.__dict__:
+                setattr(IC, key, getattr(self, gkey))
+        # It might be worth storing the geometric_simple_factors and geometric_simple_multiplicities,
+        # but that's not done at the moment
         return IC
 
     @pg_boolean
@@ -2292,6 +2348,96 @@ class IsogenyClass(PGSaver):
         else:
             return [map(ZZ, pari(poly).polredbest().polredabs()) for poly, e in self.Ppoly_factors]
 
+    @pg_jsonb(internal=True)
+    def geometric_splitting_coeffs(self):
+        if set(self.number_fields) == set(self.geometric_number_fields):
+            return self.splitting_coeffs
+        else:
+            return self.geometric_basechange.splitting_coeffs
+
+    @pg_jsonb(internal=True)
+    def splitting_coeffs(self):
+        # Exponents don't matter
+        R = QQ['x']
+        factors = [f for (f, e) in self.Ppoly_factors]
+
+        # Normalize so that we group factors based on the number field they generate
+        # This can eliminate some of the worst cases with products of quadratics
+        if len(factors) > 1:
+            by_deg = defaultdict(list)
+            for f in factors:
+                # We can remove factors of degree 1
+                if f.degree() > 1:
+                    by_deg[f.degree()].append(f)
+            for d in by_deg:
+                of_deg_d = by_deg[d]
+                if len(of_deg_d) > 1:
+                    by_deg[d] = list(set(R(pari(f).polredbest().polredabs()) for f in of_deg_d))
+            factors = sum(by_deg.values(), [])
+
+        # Handle some easy cases without resorting to Galois computations
+        if all(f.degree() <= 2 for f in factors):
+            K = None
+            for f in factors:
+                if f.degree() == 1:
+                    continue
+                if K is None:
+                    K = magma.NumberField(f)
+                    continue
+                K = K.Compositum(magma.NumberField(f))
+            if K is None:
+                # all degree 1
+                return [[ZZ(0), ZZ(1)]], ZZ(1)
+            return [map(ZZ, pari(K.DefiningPolynomial().sage()).polredbest().polredabs())], ZZ(K.MaximalOrder().AbsoluteDiscriminant())
+
+        # Now we find the smallest siblings, ordered by number field label
+        # (up to the last part, which we might not know)
+        poly = prod(factors)
+        deg_bound = prod(f.degree() for f in factors) # compositum provides a bound
+        G, r, S = magma.GaloisGroup(poly, nvals=3)
+        # In the generic case, the only siblings have the same degree
+        indkwds = {'IndexLimit': deg_bound}
+        if len(factors) == 1 and "galois_groups" in self.__dict__:
+            GG = self.galois_groups[0]
+            if GG in ["4T3", "6T11", "8T44", "10T39", "12T293"]: # could include other groups, but probably not worth the effort since other groups are rare
+                indkwds = {'IndexEqual': deg_bound}
+        subs = [magma('%s`subgroup'%(H.name())) for H in magma.Subgroups(G, **indkwds)]
+        subs = [H for H in subs if len(G.Core(H)) == 1]
+        D0 = ZZ(self.number_fields[0].split('.')[2])
+        if len(factors) == 1 and len(subs) == 1:
+            return self.polred_coeffs, D0
+        indexes = [G.Index(H) for H in subs]
+        min_index = min(indexes)
+        subs = [H for (H, index) in zip(subs, indexes) if index == min_index]
+        stems = [S.GaloisSubgroup(H) for H in subs]
+        K0 = magma(self.polred_polynomials[0]).NumberField()
+        # For larger degrees, computing the maximal order can be expensive
+        discs = []
+        for f in stems:
+            if K0 is not None and f.NumberField().IsIsomorphic(K0):
+                K0 = None
+                D = D0
+            else:
+                D = ZZ(f.NumberField().MaximalOrder().AbsoluteDiscriminant())
+            discs.append(D)
+        min_disc = min(discs)
+        stems = [f.sage() for (f, D) in zip(stems, discs) if D == min_disc]
+        return [map(ZZ, pari(f).polredbest().polredabs()) for f in stems], ZZ(min_disc)
+
+    def _pick_nf(self, coeffs):
+        nfs = [self._nf_lookup(f).get('label') for f in coeffs]
+        if not any(nf is None for nf in nfs):
+            nfs.sort(key=lambda nf: map(ZZ, nf.split('.')))
+            return nfs[0]
+
+    @pg_text
+    def splitting_field(self):
+        return self._pick_nf(self.splitting_coeffs[0])
+
+    @pg_text
+    def geometric_splitting_field(self):
+        return self._pick_nf(self.geometric_splitting_coeffs[0])
+
     def polred_hint(self, hint):
         """
         When computing the polred_coeffs for a basechange, having the polred_coeffs for the
@@ -2359,6 +2505,26 @@ class IsogenyClass(PGSaver):
             self.polred_coeffs = polred_coeffs
         return self.polred_coeffs
 
+    @staticmethod
+    def _nf_lookup(coeffs):
+        """
+        INPUT:
+
+        - ``coeffs`` -- a list of integers giving an irreducible polredabsed polynomial.
+        """
+        if len(coeffs) == 3: # quadratic, where we don't need a db lookup
+            sig = 0 if coeffs[0] > 0 else 2
+            disc = coeffs[1]^2 - 4*coeffs[0]
+            return {'label':'2.%s.%s.1' % (sig, abs(disc)),
+                    'degree':2,
+                    'galt':1}
+        else:
+            rec = get_db().nf_fields.lucky({'coeffs':coeffs}, projection=['label','degree','galt'], sort=[])
+            if rec is None:
+                return {}
+            else:
+                return rec
+
     @lazy_attribute
     def _nf_data(self):
         """
@@ -2367,22 +2533,15 @@ class IsogenyClass(PGSaver):
         nfs = []
         gals = []
         for coeffs in self.polred_coeffs:
-            if len(coeffs) == 3: # quadratic, where we don't need a db lookup
-                sig = 0 if coeffs[0] > 0 else 2
-                disc = coeffs[1]^2 - 4*coeffs[0]
-                rec = {'label':'2.%s.%s.1' % (sig, abs(disc)),
-                       'degree':2,
-                       'galt':1}
-            else:
-                rec = get_db().nf_fields.lucky({'coeffs':coeffs}, projection=['label','degree','galt'], sort=[])
-            if rec is None: # not in LMFDB
-                nfs.append(r'\N')
-                gals.append(r'\N')
-            else:
+            rec = self._nf_lookup(coeffs)
+            if rec:
                 label = rec['label']
                 gal = "%sT%s" % (rec['degree'], rec['galt'])
                 nfs.append(label)
                 gals.append(gal)
+            else: # not in LMFDB
+                nfs.append(r'\N')
+                gals.append(r'\N')
         return nfs, gals
 
     @pg_text(internal=True)
@@ -2480,7 +2639,8 @@ class IsogenyClass(PGSaver):
         raise RuntimeError(self.label)
     @pg_integer
     def twist_count(self):
-        return len(self.twists)
+        # self doesn't appear in twists, and there can be repeats (with different degrees)
+        return 1 + len(set(x[0] for x in self.twists))
     @pg_integer
     def max_twist_degree(self):
         if not self.twists:
@@ -2994,10 +3154,9 @@ class IsogenyClass(PGSaver):
 for d in range(1,6):
     def dim_factors(self, d=d): # Need to bind d before it changes
         # Have to make a local copy of d since d is changing in the loop
-        return sum([e for (simp_label, e) in zip(self.simple_distinct, self.simple_multiplicities)
-                    if simp_label.split('.')[0] == str(d)])
+        return sum([e for (IC, e) in self.decomposition if IC.g == d])
     def dim_distinct(self, d=d):
-        return len([simp_label for simp_label in self.simple_distinct if simp_label.split('.')[0] == str(d)])
+        return len([e for (IC, e) in self.decomposition if IC.g == d])
     def geom_dim_factors(self, d=d):
         # Set in base change stage
         return getattr(self.geometric_basechange, "dim%d_factors"%d)
@@ -3042,16 +3201,27 @@ class UnknownFieldRecord(PGSaver):
     """
     This class is used to output data for adding new fields to the LMFDB
     """
-    def __init__(self, IC):
-        if not IC.is_simple:
-            raise ValueError("UnknownFieldRecord requires a simple isogeny class")
-        self.f = f = IC.polred_polynomials[0]
-        self.coeffs = coeffs = IC.polred_coeffs[0]
-        self.K = NumberField(f, 'a')
-        self.label = get_db().nf_fields.lucky({'coeffs':coeffs}, projection='label')
+    def __init__(self, coeffs, disc=None):
+        self.coeffs = coeffs
+        if disc is not None:
+            self.discriminant = disc
+
+    @lazy_attribute
+    def K(self):
+        f = ZZ['x'](self.coeffs)
+        return NumberField(f, 'a')
+
+    @lazy_attribute
+    def discriminant(self):
+        return self.K.discriminant()
+
+    @lazy_attribute
+    def label(self):
+        return get_db().nf_fields.lucky({'coeffs':self.coeffs}, projection='label')
+
     @pg_jsonb
     def data(self):
-        return [self.coeffs, self.K.discriminant().support()]
+        return [self.coeffs, self.discriminant.support()]
 
 class FieldRecord(PGSaver):
     """
@@ -3316,3 +3486,76 @@ def check_pair_lcms(g, q):
             #    results.add((predicted, actual))
     return results
 
+def check_twist_degrees():
+    # The following are the results of Cyclotomic().twist_degrees(g)
+    TD = {1: [2, 3, 4, 6, 8, 12],
+          2: [2, 3, 4, 5, 6, 8, 10, 12, 15, 16, 20, 24, 30, 40, 48, 60],
+          3: [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 20, 21, 24, 26, 28, 30, 35, 36, 39, 40, 42, 45, 48, 52, 56, 60, 63, 70, 72, 78, 80, 84, 90, 104, 105, 112, 120, 126, 140, 144, 156, 168, 180, 210, 240],
+          4: [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 20, 21, 24, 26, 28, 30, 32, 35, 36, 39, 40, 42, 45, 48, 52, 56, 60, 63, 65, 70, 72, 78, 80, 84, 90, 96, 104, 105, 112, 120, 126, 130, 140, 144, 156, 160, 168, 180, 195, 208, 210, 224, 240, 252, 260, 280, 288, 312, 336, 360, 390, 420, 480, 504, 520, 560, 624, 720, 780, 840],
+          5: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 21, 22, 24, 25, 26, 28, 30, 31, 32, 33, 35, 36, 39, 40, 41, 42, 44, 45, 48, 50, 52, 55, 56, 60, 61, 62, 63, 65, 66, 70, 72, 75, 77, 78, 80, 82, 84, 88, 90, 91, 93, 96, 99, 100, 104, 105, 110, 112, 117, 120, 122, 123, 124, 126, 130, 132, 140, 143, 144, 150, 154, 155, 156, 160, 164, 165, 168, 175, 176, 180, 182, 183, 186, 195, 198, 200, 208, 210, 220, 224, 225, 231, 234, 240, 244, 246, 248, 252, 260, 264, 273, 280, 286, 288, 300, 308, 310, 312, 315, 328, 330, 336, 350, 352, 360, 364, 366, 372, 385, 390, 396, 400, 416, 420, 429, 440, 450, 455, 462, 465, 468, 480, 488, 492, 495, 496, 504, 520, 525, 528, 546, 560, 572, 585, 600, 616, 620, 624, 630, 660, 672, 700, 720, 728, 732, 744, 770, 780, 792, 840, 858, 880, 900, 910, 924, 930, 936, 990, 1008, 1040, 1050, 1092, 1120, 1170, 1200, 1248, 1260, 1320, 1365, 1440, 1456, 1560, 1680, 1820, 1872, 2184, 2340, 2520, 2730, 3120],
+          6: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 21, 22, 24, 25, 26, 28, 30, 31, 32, 33, 35, 36, 39, 40, 41, 42, 44, 45, 48, 50, 52, 55, 56, 60, 61, 62, 63, 65, 66, 70, 72, 75, 77, 78, 80, 82, 84, 88, 90, 91, 93, 96, 99, 100, 104, 105, 110, 112, 117, 120, 122, 123, 124, 126, 130, 132, 140, 143, 144, 150, 154, 155, 156, 160, 164, 165, 168, 175, 176, 180, 182, 183, 186, 195, 198, 200, 205, 208, 210, 217, 220, 224, 225, 231, 234, 240, 244, 246, 248, 252, 260, 264, 273, 279, 280, 286, 288, 300, 308, 310, 312, 315, 328, 330, 336, 350, 352, 360, 364, 366, 372, 385, 390, 396, 400, 410, 416, 420, 429, 434, 440, 450, 455, 462, 465, 468, 480, 488, 492, 495, 496, 504, 520, 525, 528, 546, 558, 560, 572, 585, 600, 615, 616, 620, 624, 630, 651, 656, 660, 672, 693, 700, 720, 728, 732, 744, 770, 780, 792, 800, 819, 820, 840, 858, 868, 880, 900, 910, 924, 930, 936, 984, 990, 1008, 1040, 1050, 1056, 1092, 1116, 1120, 1144, 1155, 1170, 1200, 1230, 1232, 1240, 1248, 1260, 1302, 1320, 1365, 1386, 1400, 1440, 1456, 1464, 1488, 1540, 1560, 1584, 1638, 1640, 1680, 1716, 1736, 1760, 1800, 1820, 1848, 1860, 1872, 1968, 1980, 2016, 2080, 2100, 2184, 2232, 2310, 2340, 2400, 2460, 2520, 2604, 2640, 2730, 2772, 2912, 3080, 3120, 3276, 3360, 3432, 3640, 3696, 3720, 3744, 3960, 4200, 4368, 4620, 4680, 5040, 5460, 6240, 6552, 7280, 9360, 10920]
+    }
+    with open("/home/roed/avfq/twist_stats.txt") as F:
+        s = F.read()
+    s = [c.split(':') for c in s.split('\n')[3:] if c]
+    st = [(ZZ(c[0]), ZZ(c[1]), map(ZZ, c[3][1:-1].split(','))) for c in s if c]
+    Tactual = defaultdict(set)
+    lastq = defaultdict(ZZ)
+    lastd = defaultdict(list)
+    for g, q, degs in st:
+        for d in degs:
+            if d not in Tactual[g]:
+                if q >= 3:
+                    lastd[g,q].append(d)
+                lastq[g] = max(q, lastq[g])
+                Tactual[g].add(d)
+    for g in range(1,7):
+        diff = set(TD[g]) - set(Tactual[g])
+        extra = set(Tactual[g]) - set(TD[g])
+        if extra:
+            print "WARNING, EXTRA!", g, extra
+        prim = []
+        for m in diff:
+            for d in m.divisors():
+                if d != m and d in diff:
+                    break
+            else:
+                prim.append(m)
+        print g, sorted(prim)
+
+    for g,q in sorted(lastd):
+        print "g =", g, "q =", q, ":", sorted(lastd[g,q])
+
+def twist_deg_search(IC, g=2, degs=[15,20,30], qL=[4,5,9,16,25,49,64,81,125,169,256,625,729,1024]):
+    results = []
+    C = {d:CyclotomicField(d) for d in degs}
+    for q in qL:
+        filename = '/home/roed/avfq/complete/av_fq_isog_g{g}_q{q}.txt'.format(g=g, q=q)
+        for A in IC.load(filename):
+            for B, _, d in A.twists:
+                if d in degs:
+                    B = IsogenyClass(label=B)
+                    for f,e in A.Ppoly_factors:
+                        if not f.roots(C[d]):
+                            results.append((A.label, B.label, A.Ppoly, B.Ppoly, A.number_fields, B.number_fields, A.geometric_number_fields))
+                            break
+                    else:
+                        for f, e in B.Ppoly_factors:
+                            if not f.roots(C[d]):
+                                results.append((A.label, B.label, A.Ppoly, B.Ppoly, A.number_fields, B.number_fields, A.geometric_number_fields))
+                                break
+        print q, len(results), results[-1] if results else ""
+    return results
+
+def nf_search(IC, g=2, deg=16):
+    C = CyclotomicField(deg)
+    results = []
+    labels = set([db.nf_fields.lucky({'coeffs':map(ZZ, pari(K.defining_polynomial()).polredbest().polredabs())}, 'label') for K, map1, map2 in C.subfields()])
+    for gg,q in sorted(IC.gq):
+        if g == gg:
+            print q, len(results)
+            filename = '/home/roed/avfq/basic/weil_all_g{g}_q{q}.txt'.format(g=g, q=q)
+            for A in IC.load(filename):
+                if all(nf in labels for nf in A.number_fields):
+                    results.append(A.Ppoly)
+    return results
