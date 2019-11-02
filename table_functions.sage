@@ -1035,7 +1035,7 @@ class GenericBigAccumulator(GenericAccumulator):
 
     @lazy_attribute
     def gq(self):
-        return sorted(self.stage.controller.gq)
+        return sorted(self.stage.gq)
 
     @lazy_attribute
     def input_data(self):
@@ -1055,6 +1055,10 @@ class Stage(object):
         self.controller = controller
         self.input = input
         self.output = output
+        if hasattr(self, 'unique') and self.unique:
+            self.gq = [(0,0)]
+        else:
+            self.gq = controller.gq
         if hasattr(self, "Spawner"):
             # It's easy to forget to include {i} in the output filenames
             # If you do, all the spawned subtasks will write to the same file....
@@ -1064,14 +1068,10 @@ class Stage(object):
 
     @lazy_attribute
     def tasks(self):
-        if hasattr(self, 'unique') and self.unique:
-            gq = [(0,0)]
-        else:
-            gq = self.controller.gq
         if hasattr(self, "Spawner"):
-            L = [self.Spawner(self, g, q) for g, q in gq]
+            L = [self.Spawner(self, g, q) for g, q in self.gq]
         else:
-            L = [self.Task(self, g, q) for g, q in gq]
+            L = [self.Task(self, g, q) for g, q in self.gq]
         if any(accum is not None for ofile, accum, odata in self.output):
             L.append(self.BigAccumulator(self))
         return L
@@ -1445,7 +1445,7 @@ class IsogenyClasses(Controller):
             remove_duplicates = True
         class Task(GenericTask):
             def run(self):
-                qs = [q for (g,q) in self.stage.controller.gq if g == self.g and q.is_power_of(self.q)]
+                qs = [q for (g,q) in self.stage.gq if g == self.g and q.is_power_of(self.q)]
                 rs = [q.exact_log(self.q) for q in qs]
                 ICs = []
                 simple_factors = {}
@@ -1562,7 +1562,7 @@ class IsogenyClasses(Controller):
         class BCTask(GenericTask):
             @lazy_attribute
             def qs(self):
-                return sorted([q for (g, q) in self.stage.controller.gq if g == self.g and self.q.is_power_of(q)])
+                return sorted([q for (g, q) in self.stage.gq if g == self.g and self.q.is_power_of(q)])
             @lazy_attribute
             def rs(self):
                 return [q.is_prime_power(get_data=True)[1] for q in self.qs]
@@ -1642,6 +1642,102 @@ class IsogenyClasses(Controller):
                     find_twists(cluster)
                 self.save(by_Lpoly[r].values())
 
+    class StageImportJac(Stage):
+        """
+        This Stage is used to import data from Drew's Jacobian calculations into a form usable
+        by the Combine stage.
+
+        The currently implementation of this Stage only works for g <= 3, matching Drew's output files.
+        """
+        name = 'Import Jacobians'
+        shortname = 'ImpJac'
+        def __init__(self, *args, **kwds):
+            Stage.__init__(self, *args, **kwds)
+            def torun(g, q):
+                if g < 3:
+                    return ope(self.input[1].format(g=g, q=q))
+                elif g == 3:
+                    # Assume that hyp is more readily available than spq
+                    return ope(self.input[2].format(g=g, q=q))
+                else:
+                    return False
+            self.gq = [(g, q) for (g, q) in self.gq if torun(g, q)]
+        class Task(GenericTask):
+            def run(self):
+                jac_count = defaultdict(int)
+                hyp_count = defaultdict(int)
+                curves = defaultdict(list)
+                R = GF(self.q, 'a')['x']
+                def stringify_hyp(poly):
+                    if self.q == 2:
+                        f, g = map(lambda s: R([ZZ(c) for c in s.split(',')]), poly[2:-2].split('],['))
+                    elif self.q % 2 == 0:
+                        f, g = map(lambda s: R([[ZZ(c) for c in d.split(',')] for d in s.split('],[')]), poly[3:-3].split(']],[['))
+                    elif self.q.is_prime():
+                        f, g = R(map(ZZ, poly[1:-1].split(','))), R(0)
+                    else:
+                        g = R(0)
+                        f, g = R([[ZZ(c) for c in d.split(',')] for d in poly[2:-2].split('],[')]), R(0)
+                    # We don't want to use \left, and we're not going to get exponents larger than 9
+                    # so we just str then replace * with space.
+                    if g == 0:
+                        LHS = 'y^2'
+                    elif g == 1:
+                        LHS = 'y^2+y'
+                    elif g.degree() == g.valuation():
+                        LHS = 'y^2+{g}*y'
+                    else:
+                        LHS = 'y^2+({g})*y'
+                    LHS = LHS.format(g=g).replace(' ', '')
+                    RHS = str(f).replace(' ', '')
+                    return '%s=%s' % (LHS, RHS)
+                def process_hyps(filename):
+                    with open(filename) as Fin:
+                        for line in Fin:
+                            q, short_curve_counts, poly, aut = line.strip().split(':')
+                            short_curve_counts = tuple(map(ZZ, short_curve_counts[1:-1].split(',')))
+                            poly = stringify_hyp(poly)
+                            curves[short_curve_counts].append(poly)
+                            hyp_count[short_curve_counts] += 1
+                            jac_count[short_curve_counts] += 1
+                def process_spq(filename):
+                    with open(filename) as Fin:
+                        for line in Fin:
+                            q, short_curve_counts, poly, aut = line.strip().split(':')
+                            short_curve_counts = tuple(map(ZZ, short_curve_counts[1:-1].split(',')))
+                            curves[short_curve_counts].append(poly + '=0')
+                            jac_count[short_curve_counts] += 1
+                outfile, accum, data = self.stage.output[0]
+                if self.g < 3:
+                    if ope(self.input_data[1][1]):
+                        all_jacobians = True
+                        process_hyps(self.input_data[1][1])
+                    else:
+                        self._finish(outfile, self.t0)
+                        return
+                elif self.g == 3:
+                    if ope(self.input_data[2][1]):
+                        process_hyps(self.input_data[2][1])
+                    else:
+                        self._finish(outfile, self.t0)
+                        return
+                    if ope(self.input_data[3][1]):
+                        process_spq(self.input_data[3][1])
+                        all_jacobians=True
+                    else:
+                        all_jacobians=False
+                def make_all():
+                    for IC in self.load(self.input_data[0][1]):
+                        IC.hyp_count = hyp_count[tuple(IC.short_curve_counts)]
+                        IC.curves = curves[tuple(IC.short_curve_counts)]
+                        if all_jacobians:
+                            IC.jacobian_count = jac_count[tuple(IC.short_curve_counts)]
+                            IC.has_jacobian = 1 if IC.curves else -1
+                        else:
+                            IC.has_jacobian = 1 if IC.curves else 0
+                        yield IC
+                self.save(make_all())
+
     class StageCombine(Stage):
         """
         This Stage is used to combine data from multiple sources into a single file per g,q.
@@ -1669,7 +1765,7 @@ class IsogenyClasses(Controller):
                         ICs = data[key]
                         # splitting_field and geometric_splitting_field might not have been added
                         # to the LMFDB at the time the polynomials were added
-                        fix_none = ['splitting_field', 'geometric_splitting_field']
+                        #fix_none = ['splitting_field', 'geometric_splitting_field']
                         yield IsogenyClass.combine(ICs, fix_none=fix_none)
                 self.save(make_all())
 
@@ -1854,6 +1950,8 @@ class IsogenyClass(PGSaver):
     """
     An isogeny class of abelian varieties over a finite field, as constructed from a Weil polynomial
     """
+    bool_unknokwn_cols = ['has_jacobian', 'has_principal_polarization']
+
     @classmethod
     def by_decomposition(cls, factors):
         """
@@ -1880,7 +1978,11 @@ class IsogenyClass(PGSaver):
             for key, val in D.items():
                 if key in all_attrs:
                     if val != all_attrs[key]:
-                        raise ValueError("Two different values for %s: %s and %s"%(key, val, all_attrs[key]))
+                        # It's possible that we're refining an unknown value
+                        if key in cls.bool_unknown_cols and val * all_attrs[key] == 0: # one value 0
+                            all_attrs[key] = val + all_attrs[key] # set to nonzero value
+                        else:
+                            raise ValueError("Two different values for %s: %s and %s"%(key, val, all_attrs[key]))
                 elif key not in fix_none or val is not None:
                     all_attrs[key] = val
         IC = cls()
