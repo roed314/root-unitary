@@ -957,7 +957,7 @@ class GenericTask(object):
         self.t0 = datetime.utcnow()
         self.run()
         self.log("Finished")
-    def enumerate(self, sequence, start=0, freq=None):
+    def enumerate(self, sequence, start=0, freq=None, header=''):
         if freq is None:
             freq = self.stage.controller.logfrequency
         try:
@@ -966,7 +966,7 @@ class GenericTask(object):
             slen = ''
         for i, item in enumerate(sequence, start):
             if i and i%freq == 0:
-                self.log('%s%s' % (i, slen))
+                self.log(header + '%s%s' % (i, slen))
             yield item
 
 class GenericSpawner(GenericTask):
@@ -1737,12 +1737,14 @@ class IsogenyClasses(Controller):
                 hyp_count = defaultdict(int)
                 curves = defaultdict(list)
                 R = GF(self.q, 'a')['x']
+                qisprime = self.q.is_prime()
+                qiseven = (self.q % 2 == 0)
                 def stringify_hyp(poly):
                     if self.q == 2:
                         f, g = map(lambda s: R([ZZ(c) for c in s.split(',')]), poly[2:-2].split('],['))
-                    elif self.q % 2 == 0:
+                    elif qiseven:
                         f, g = map(lambda s: R([[ZZ(c) for c in d.split(',')] for d in s.split('],[')]), poly[3:-3].split(']],[['))
-                    elif self.q.is_prime():
+                    elif qisprime:
                         f, g = R(map(ZZ, poly[1:-1].split(','))), R(0)
                     else:
                         g = R(0)
@@ -1762,7 +1764,7 @@ class IsogenyClasses(Controller):
                     return '%s=%s' % (LHS, RHS)
                 def process_hyps(filename):
                     with open(filename) as Fin:
-                        for line in Fin:
+                        for line in self.enumerate(Fin, header='hyp '):
                             q, short_curve_counts, poly, aut = line.strip().split(':')
                             short_curve_counts = tuple(map(ZZ, short_curve_counts[1:-1].split(',')))
                             poly = stringify_hyp(poly)
@@ -1771,7 +1773,7 @@ class IsogenyClasses(Controller):
                             jac_count[short_curve_counts] += 1
                 def process_spq(filename):
                     with open(filename) as Fin:
-                        for line in Fin:
+                        for line in self.enumerate(Fin, header='spq '):
                             q, short_curve_counts, poly, aut = line.strip().split(':')
                             short_curve_counts = tuple(map(ZZ, short_curve_counts[1:-1].split(',')))
                             curves[short_curve_counts].append(poly + '=0')
@@ -1796,7 +1798,7 @@ class IsogenyClasses(Controller):
                     else:
                         all_jacobians=False
                 def make_all():
-                    for IC in self.load(self.input_data[0][1]):
+                    for IC in self.enumerate(self.load(self.input_data[0][1]), header='make '):
                         IC.hyp_count = hyp_count[tuple(IC.short_curve_counts)]
                         IC.curves = curves[tuple(IC.short_curve_counts)]
                         if all_jacobians:
@@ -1806,6 +1808,28 @@ class IsogenyClasses(Controller):
                             IC.has_jacobian = 1 if IC.curves else 0
                         yield IC
                 self.save(make_all())
+
+    class StageImportIsom(Stage):
+        name = 'Import Isom'
+        shortname = 'ImpIsom'
+        class Task(GenericTask):
+            def ready(self):
+                return ope(self.input_data[0][1])
+            def run(self):
+                with open(self.input_data[0][1]) as Fin:
+                    outfile, accum, attributes = self.stage.output[0]
+                    outfile = outfile.format(**self.kwds)
+                    types = [getattr(IsogenyClass, attr) for attr in attributes]
+                    header = [':'.join(attributes),
+                              ':'.join(attr.pg_type for attr in types),
+                              '\n']
+                    with open(outfile, 'w') as Fout:
+                        for i, line in enumerate(Fin):
+                            if i == 0:
+                                Fout.write('\n'.join(header))
+                            else:
+                                Fout.write(line)
+                self.stage.controller._finish(outfile, self.t0)
 
     class StageCombine(Stage):
         """
@@ -1834,7 +1858,7 @@ class IsogenyClasses(Controller):
                         ICs = data[key]
                         # splitting_field and geometric_splitting_field might not have been added
                         # to the LMFDB at the time the polynomials were added
-                        #fix_none = ['splitting_field', 'geometric_splitting_field']
+                        fix_none = ['splitting_field', 'geometric_splitting_field']
                         yield IsogenyClass.combine(ICs, fix_none=fix_none)
                 self.save(make_all())
 
@@ -1988,6 +2012,7 @@ class IsogenyClasses(Controller):
         self._finish(filename, t0)
 
 class PGSaver(object):
+    bool_unknown_cols = []
     @classmethod
     def load(cls, s, header):
         """
@@ -2019,7 +2044,7 @@ class IsogenyClass(PGSaver):
     """
     An isogeny class of abelian varieties over a finite field, as constructed from a Weil polynomial
     """
-    bool_unknokwn_cols = ['has_jacobian', 'has_principal_polarization']
+    bool_unknown_cols = ['has_jacobian', 'has_principal_polarization']
 
     @classmethod
     def by_decomposition(cls, factors):
@@ -2050,8 +2075,8 @@ class IsogenyClass(PGSaver):
                         # It's possible that we're refining an unknown value
                         if key in cls.bool_unknown_cols and val * all_attrs[key] == 0: # one value 0
                             all_attrs[key] = val + all_attrs[key] # set to nonzero value
-                        else:
-                            raise ValueError("Two different values for %s: %s and %s"%(key, val, all_attrs[key]))
+                        elif key != 'size': # TODO: REMOVE HACK
+                            raise ValueError("Two different values in %s for %s: %s and %s"%(D.get('label', 'unknown'), key, val, all_attrs[key]))
                 elif key not in fix_none or val is not None:
                     all_attrs[key] = val
         IC = cls()
@@ -2464,6 +2489,10 @@ class IsogenyClass(PGSaver):
     def has_geom_ss_factor(self):
         # set by base change stage
         return any(simple_factor.center_dim == 1 for simple_factor, mult in self.geometric_basechange.decomposition)
+
+    @pg_smallint
+    def max_divalg_dim(self):
+        return max(simple_factor.divalg_dim for simple_factor, mult in self.decomposition)
 
     @pg_smallint
     def max_geom_divalg_dim(self):
@@ -2908,6 +2937,13 @@ class IsogenyClass(PGSaver):
     def divalg_dim(self):
         return (2*self.g // self.center_dim)^2
 
+    @pg_smallint
+    def endalg_qdim(self):
+        return sum(m^2 * (4 * S.g^2) // S.center_dim for S, m in self.decomposition)
+
+    @pg_smallint
+    def geom_endalg_qdim(self):
+        return self.geometric_basechange.endalg_qdim
 
     # Functions for determining whether the isogeny class corresponding to a Weil polynomial
     # has a principal polarization/a Jacobian
@@ -3521,31 +3557,6 @@ def combine_polys():
                         for i, line in enumerate(Fin):
                             if i > 2:
                                 Fout.write(line)
-
-def adjust_isom_data():
-    """
-    This function is used to import Stefano's output into a format loadable by IsogenyClasses
-    """
-    indir = '/home/roed/avfq/external/isom_raw'
-    outdir = '/home/roed/avfq/external/isom_data'
-    cols = 'label:zfv_is_bass:zfv_is_maximal:zfv_index:zfv_index_factorization:zfv_plus_index:zfv_plus_index_factorization:zfv_plus_norm'
-    typs = 'text:boolean:boolean:numeric:numeric[]:numeric:numeric[]:numeric'
-    n = len(cols)
-    for filename in os.listdir(indir):
-        g, q = map(ZZ, filename.split('_')[:2])
-        outfilename = opj(outdir, 'weil_isomdata_g{g}_q{q}.txt'.format(g=g, q=q))
-        with open(opj(indir, filename)) as Fin:
-            with open(opj(outdir, outfilename), 'w') as Fout:
-                for i, line in enumerate(Fin):
-                    if i == 0:
-                        # There was a missing newline in the initial data, and we also need to add types
-                        #if not line.startswith(cols) and line[n].isdigit():
-                        #    raise ValueError("Update adjusting code")
-                        Fout.write(cols+'\n')
-                        Fout.write(typs+'\n\n')
-                        Fout.write(line[n:])
-                    else:
-                        Fout.write(line)
 
 def adjust_jac_data():
     """
