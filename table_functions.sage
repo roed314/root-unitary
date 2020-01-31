@@ -38,7 +38,7 @@ AUTHORS:
 
   - (2016-05-11) Taylor Dupuy, Kiran S. Kedlaya, David Roe, Christelle Vincent
   - (2019-02-02) David Roe, Everett Howe, added more tests for principal polarizations and Jacobians
-  - (2019-05-01) Major refactoring and documentation
+  - (2019) David Roe, Major refactoring and documentation
 
 EXAMPLES:
 
@@ -126,7 +126,7 @@ import heapq
 opj, ope = os.path.join, os.path.exists
 from copy import copy
 from collections import defaultdict, Counter
-from multiprocessing import Process
+from multiprocessing import Process, Queue
 from string import letters
 from datetime import datetime
 from itertools import combinations, combinations_with_replacement, imap, izip_longest, islice
@@ -148,6 +148,54 @@ load("weil_polynomials.pyx")
 @cached_function
 def get_db():
     return PostgresDatabase()
+
+######################################################################################################
+
+# Timeout utility, adapted from http://code.activestate.com/recipes/577853-timeout-decorator-with-multiprocessing/
+# Timeouts are not yet used in the remainder of this file
+
+class TimeoutException(Exception):
+    pass
+
+class RunableProcessing(Process):
+    def __init__(self, func, *args, **kwargs):
+        self.queue = Queue(maxsize=1)
+        args = (func,) + args
+        Process.__init__(self, target=self.run_func, args=args, kwargs=kwargs)
+
+    def run_func(self, func, *args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+            self.queue.put((True, result))
+        except Exception as e:
+            self.queue.put((False, e))
+
+    def done(self):
+        return self.queue.full()
+
+    def result(self):
+        return self.queue.get()
+
+def timeout(seconds, force_kill=True):
+    def wrapper(function):
+        def inner(*args, **kwargs):
+            now = time.time()
+            proc = RunableProcessing(function, *args, **kwargs)
+            proc.start()
+            proc.join(seconds)
+            if proc.is_alive():
+                if force_kill:
+                    proc.terminate()
+                runtime = time.time() - now
+                raise TimeoutException('timed out after {:.2f} seconds'.format(runtime))
+            assert proc.done()
+            success, result = proc.result()
+            if success:
+                return result
+            else:
+                raise result
+        return inner
+    return wrapper
 
 ######################################################################################################
 
@@ -276,7 +324,7 @@ def base_change(Lpoly, r, algorithm=None, g = None, q = None, prec=53):
                 r = r//ell
         for ell, e in ZZ(r).factor():
             for i in range(e):
-                Lpoly = base_change(Lpoly, ell, algorithm='linalg', g=g, q=q)
+                Lpoly = base_change(Lpoly, ell, algorithm='resultant', g=g, q=q)
         return Lpoly
     elif algorithm == 'approx':
         C = ComplexField(prec)
@@ -291,6 +339,12 @@ def base_change(Lpoly, r, algorithm=None, g = None, q = None, prec=53):
         if actual_error > acceptable_error:
             raise RuntimeError(actual_error)
         return Lpoly.parent()(exact_coeffs)
+    elif algorithm == 'resultant':
+        # This seems to be slightly faster than the following 'linalg' method, with a larger difference for smaller g
+        R = Lpoly.parent()
+        T = R.gen()
+        S.<u> = R[]
+        return Lpoly(u).resultant(u^r - T)
     elif algorithm == 'linalg':
         # From https://github.com/edgarcosta/endomorphisms/blob/master/endomorphisms/OverFiniteField/utils.py
         K.<zeta> = CyclotomicField(r)
@@ -315,11 +369,10 @@ def base_change(Lpoly, r, algorithm=None, g = None, q = None, prec=53):
 def hom_degrees(f, g, q):
     x = f.parent().gen()
     tcp = tensor_charpoly(f, g)(x/q)
+    # We only care about the part of tcp which is a product of cyclotomic polynomials
+    tcp = tcp.cyclotomic_part()
     # There seems to be a difficult-to-diagnose bug in factor, which causes
     # PariError: bug in gerepile, significant pointers lost, please report
-    # Scaling tcp so that it has integral coefficients helps but
-    # doesn't completely solve the problem.
-    tcp *= tcp.denominator()
 
     try:
         factors = tcp.factor()
@@ -331,12 +384,11 @@ def hom_degrees(f, g, q):
         for fac, e in sqfree:
             for subfac, sube in fac.factor():
                 factors.append((subfac, e*sube))
-    degrees = []
-    for factor, power in factors:
-        m = Cyclotomic().order(factor)
-        if m > 0:
-            degrees.append(m)
-    return sorted(degrees)
+    degrees = sorted(Cyclotomic().order(factor) for (factor, power) in factors)
+    if degrees[0] == 0:
+        # Every factor should by cyclotomic
+        raise RuntimeError
+    return degrees
 
 def minimal_twists(IC1, IC2, min_degs=None, max_degs=None):
     """
@@ -862,10 +914,12 @@ class GenericTask(object):
         return all(ope(self._done(data[-1])) for data in self.input_data)
     def done(self):
         return all(ope(filename) for filename in self.donefiles)
-    def log(self, s):
+    def log(self, s, abstime=False):
         s = str(s).strip()
-        s += " (%s)" % (datetime.utcnow() - self.t0)
-        s += '\n'
+        if abstime:
+            s += " (%s)\n" % (datetime.utcnow())
+        else:
+            s += " (%s)\n" % (datetime.utcnow() - self.t0)
         if isinstance(self, GenericAccumulator):
             s = "[A] " + s
         elif self.i != '':
@@ -903,8 +957,9 @@ class GenericTask(object):
         self.t0 = datetime.utcnow()
         self.run()
         self.log("Finished")
-    def enumerate(self, sequence, start=0):
-        freq = self.stage.controller.logfrequency
+    def enumerate(self, sequence, start=0, freq=None):
+        if freq is None:
+            freq = self.stage.controller.logfrequency
         try:
             slen = '/%s' % len(sequence)
         except Exception:
@@ -1191,7 +1246,7 @@ class Controller(object):
                         print "Finished " + task.logheader
         except KeyboardInterrupt:
             # help in debugging
-            return tasks
+            return tasks, processes
 
     def status(self):
         """
@@ -1320,12 +1375,14 @@ class IsogenyClasses(Controller):
                 raise ValueError("No qs specified for the given g")
             gq_dict[g] = D = set(qs)
             for q in qs:
-                for d in q.divisors():
-                    if d != 1 and d not in D:
-                        raise ValueError("q=%s is included for g=% but its divisor %s is not" % (q, g, d))
-                for gg in range(1,g):
-                    if q not in gq_dict[gg]:
-                        raise ValueError("g=%s is included for q=%s but g=%s is not" % (g, q, gg))
+                if any(stage.shortname in ['Comp', 'Bchange'] for stage in self.stages):
+                    for d in q.divisors():
+                        if d != 1 and d not in D:
+                            raise ValueError("q=%s is included for g=% but its divisor %s is not" % (q, g, d))
+                if any(stage.shortname == 'GenAll' for stage in self.stages):
+                    for gg in range(1,g):
+                        if q not in gq_dict[gg]:
+                            raise ValueError("g=%s is included for q=%s but g=%s is not" % (g, q, gg))
                 self.gq.append((g, q))
         # We want to do low q, high g first.  This way we have all the values for a given q,
         # but do the high dimension cases first since these will take the longest.
@@ -1506,20 +1563,30 @@ class IsogenyClasses(Controller):
 
         name = 'Splitting Fields'
         shortname = 'SFields'
-        Spawner = GenericSpawner
+        class Spawner(GenericSpawner):
+            def ready(self):
+                # there's an optional input where you can provide information from other runs after changing the chunksize
+                return all(ope(self._done(data[-1])) for data in self.input_data[:2])
         class Task(GenericTask):
+            def ready(self):
+                # there's an optional input where you can provide information from other runs after changing the chunksize
+                return all(ope(self._done(data[-1])) for data in self.input_data[:2])
             def run(self):
                 ICs = []
                 NFs = []
-                sources = [self.load(filename) for (_, filename) in self.input_data]
+                sources = [self.load(filename, allow_empty=True) for (_, filename) in self.input_data]
                 data = defaultdict(list)
                 for source in sources:
                     for IC in source:
                         # We want to sort by poly since g and q are fixed
                         data[tuple(IC.poly)].append(IC)
-                self.log("Data loaded")
-                for key in self.enumerate(sorted(data.keys())):
+                for i, key in enumerate(sorted(data.keys())):
                     IC = IsogenyClass.combine(data[key])
+                    # Splitting field can be very slow, especially for larger g.
+                    # We print the label to the file so that we can find splitting fields
+                    # that we're getting stuck on
+                    if self.g > 4 or i > 0 and i%100 == 0:
+                        self.log('%s/%s ' % (i, len(data)) + IC.label, abstime=True)
                     ICs.append(IC)
                     if IC.splitting_field is None:
                         coeffs, D = IC.splitting_coeffs
@@ -1663,6 +1730,8 @@ class IsogenyClasses(Controller):
                     return False
             self.gq = [(g, q) for (g, q) in self.gq if torun(g, q)]
         class Task(GenericTask):
+            def ready(self):
+                return ope(self.input_data[0][1])
             def run(self):
                 jac_count = defaultdict(int)
                 hyp_count = defaultdict(int)
@@ -2384,6 +2453,14 @@ class IsogenyClass(PGSaver):
         return self.geometric_basechange.is_simple
 
     @pg_boolean
+    def is_supersingular(self):
+        return all(s == 1/2 for s in self.slopes)
+
+    @pg_boolean
+    def is_ordinary(self):
+        return self.p_rank_deficit == 0
+
+    @pg_boolean
     def has_geom_ss_factor(self):
         # set by base change stage
         return any(simple_factor.center_dim == 1 for simple_factor, mult in self.geometric_basechange.decomposition)
@@ -2492,6 +2569,10 @@ class IsogenyClass(PGSaver):
                 return [[ZZ(0), ZZ(1)]], ZZ(1)
             return [map(ZZ, pari(K.DefiningPolynomial().sage()).polredbest().polredabs())], ZZ(K.MaximalOrder().AbsoluteDiscriminant())
 
+        # The set of ramified primes in each stem field must be contained within
+        # the union of the sets for each factor (https://math.stackexchange.com/questions/1796472/ramification-of-prime-in-normal-closure)
+        # This saves a huge amount of time by avoiding factoring discriminants
+        ram_primes = sorted(set(sum(get_db().nf_fields.search({'label':{'$in': self.number_fields}}, 'ramps'), [])))
         # Now we find the smallest siblings, ordered by number field label
         # (up to the last part, which we might not know)
         poly = prod(factors)
@@ -2512,19 +2593,74 @@ class IsogenyClass(PGSaver):
         min_index = min(indexes)
         subs = [H for (H, index) in zip(subs, indexes) if index == min_index]
         stems = [S.GaloisSubgroup(H) for H in subs]
-        K0 = magma(self.polred_polynomials[0]).NumberField()
-        # For larger degrees, computing the maximal order can be expensive
-        discs = []
+        # Pari is much faster at computing discriminants
+        min_polys = []
+        min_disc = None
         for f in stems:
-            if K0 is not None and f.NumberField().IsIsomorphic(K0):
-                K0 = None
-                D = D0
-            else:
-                D = ZZ(f.NumberField().MaximalOrder().AbsoluteDiscriminant())
-            discs.append(D)
-        min_disc = min(discs)
-        stems = [f.sage() for (f, D) in zip(stems, discs) if D == min_disc]
-        return [map(ZZ, pari(f).polredbest().polredabs()) for f in stems], ZZ(min_disc)
+            D = ZZ(pari.nfdisc([f.sage(), ram_primes]))
+            if min_disc is None or D <= min_disc:
+                if min_disc is None or D < min_disc:
+                    min_disc = D
+                    min_polys = []
+                min_polys.append(f)
+        return [map(ZZ, pari(f.sage()).polredbest().polredabs()) for f in min_polys], ZZ(min_disc)
+
+        # The following code was used to try to work around having to compute the discriminant
+        #def ram_factor(m):
+        #    # Return the factorization of m, only including p in ram_primes
+        #    return Factorization([(p, ZZ(m).valuation(p)) for p in ram_primes])
+        #stems = [(prod(ram_factor(f.Discriminant())), f) for f in stems]
+        #stems.sort()
+        #stems = [f for (D, f) in stems]
+        ## We want to avoid computing even p-maximal orders in as many of these stem fields as we can,
+        ## so we first use small subfields to get some constraints on the actual discriminants
+        #def find_bound(nf, deg):
+        #    # Find lower bounds on the discriminants by using subfields of the given degree
+        #    # We return the bound in factored form
+        #    B = ZZ(1).factor()
+        #    for F in nf.Subfields(deg):
+        #        B = B.lcm(ram_factor(F[1].MaximalOrder().Discriminant()))
+        #    return B^(ZZ(nf.Degree()) // deg)
+        #def compute_disc(nf, early_abort=None):
+        #    E = nf.EquationOrder()
+        #    D = 1
+        #    for p in ram_primes:
+        #        Op = E.pMaximalOrder(p)
+        #        D *= p^ZZ(Op.Discriminant().Valuation(p))
+        #        if early_abort is not None and D > early_abort:
+        #            return
+        #    return D
+        #min_disc = compute_disc(stems[0].NumberField())
+        #min_polys = [stems[0]]
+        #min_index = ZZ(min_index)
+        #for f in stems[1:]:
+        #    if self.sc_verbose: # sc_verbose is a verbose flag
+        #        print f
+        #    nf = f.NumberField()
+        #    B = ZZ(1).factor()
+        #    for deg in min_index.divisors()[1:-1]:
+        #        B = B.lcm(find_bound(nf, deg))
+        #        # At first I tried aborting early once we picked up all the primes.
+        #        # But there are examples like 5.3.ac_b_g_ad_ac (degree 16 stem fields)
+        #        # where all primes are picked up at 4 but the implied discriminant
+        #        # isn't large enough to early abort while the actual orders are quite bad
+        #        # At degree 8 we get enough data to rule out the case.
+        #        if prod(B) > min_disc:
+        #            if self.sc_verbose:
+        #                print "Skipping after degree", deg
+        #            break
+        #        elif self.sc_verbose:
+        #            print "Checked degree", deg
+        #    else:
+        #        if self.sc_verbose:
+        #            print "Computing discriminant"
+        #        #D = compute_disc(nf, min_disc)
+        #        D = None
+        #        if D is not None:
+        #            if D < min_disc:
+        #                min_disc = D
+        #                min_polys = []
+        #            min_polys.append(f)
 
     def _pick_nf(self, coeffs):
         nfs = [self._nf_lookup(f).get('label') for f in coeffs]
@@ -3102,8 +3238,8 @@ class IsogenyClass(PGSaver):
             return True
 
     def _nojac_howe_lauter(self):
-        # Suppose q is a square, say q = s^2 with s positive or negative, 
-        # and we can write the real Weil polynomial as (x - 2*s)^n * h0 for 
+        # Suppose q is a square, say q = s^2 with s positive or negative,
+        # and we can write the real Weil polynomial as (x - 2*s)^n * h0 for
         # some ordinary h0 (!= 1).  If h0(2*s) is squarefree, then there is no
         # nontrivial self-dual group scheme that can be embedded in both
         # a variety with real Weil polynomial h0 and a variety with real
@@ -3661,3 +3797,28 @@ def nf_search(IC, g=2, deg=16):
                 if all(nf in labels for nf in A.number_fields):
                     results.append(A.Ppoly)
     return results
+
+def in_progress_log(g, q):
+    """
+    Used to check how far the splitting field computations have gotten
+    """
+    filename = '/home/roed/avfq/logs/SFields_{g}_{q}.log'.format(g=g, q=q)
+    recent = {}
+    done = set()
+    with open(filename) as F:
+        for line in F:
+            pieces = line.strip().split()
+            i = ZZ(pieces[0][1:-1])
+            counter = pieces[1]
+            if counter == 'Finished':
+                recent.pop(i, None)
+                done.add(i)
+            else:
+                label, start1, start2 = pieces[2:]
+                recent[i] = (counter, label, start1 + ' ' + start2)
+        bytime = [(datetime.utcnow() - datetime.strptime(start[1:-1], '%Y-%m-%d %H:%M:%S.%f'), counter, i, label) for i, (counter, label, start) in recent.items()]
+        bytime.sort(reverse=True)
+        for duration, counter, i, label in bytime:
+            print str(duration), i, counter, label
+        if done:
+            print "Done:", sorted(done)
